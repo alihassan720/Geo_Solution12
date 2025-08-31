@@ -1,0 +1,217 @@
+#############################################
+# Wildfire CO2 Flux Analysis (GFAS 2023–2024)
+# Author: Ali Hassan Shabbir
+# Description: 
+#   - Loads GFAS NetCDF CO2 flux data
+#   - Aggregates daily → monthly means (2023–2024)
+#   - Crops/masks to a region of interest (ROI shapefile)
+#   - Creates:
+#       (A) 12 monthly maps (Jan–Dec) of mean CO2 flux
+#       (B) Line plot of monthly mean CO2 flux
+#   - Combines both plots into one figure
+#############################################
+
+# -----------------------------
+# 1. Load Required Libraries
+# -----------------------------
+# Raster & vector handling
+library(terra)        # read/write rasters, crop/mask
+library(sf)           # shapefiles, reprojection
+
+# Data wrangling
+library(dplyr)        # group_by, summarise, mutate
+library(tidyr)        # pivot_longer for wide→long
+library(lubridate)    # floor_date to build monthly index
+
+# Plotting
+library(ggplot2)      # main plotting system
+library(RColorBrewer) # color palettes
+library(ggspatial)    # north arrow, scale bar
+library(scales)       # log scale helpers
+library(cowplot)      # combine plots into one figure
+
+# -----------------------------
+# 2. Load ROI shapefile & Raster
+# -----------------------------
+shpfile <- "County_Boundaries.shp"
+roi <- vect(shpfile)   # ROI as terra vector
+
+ncfile <- "gfas_2023_2024.nc"
+r <- rast(ncfile, subds = "co2fire")   # raster stack (daily layers)
+
+# -----------------------------
+# 3. Create Date Index (2023–2024)
+# -----------------------------
+start_date <- as.Date("2023-01-01")
+end_date   <- as.Date("2024-12-31")
+time_vals  <- seq.Date(start_date, end_date, by = "day")
+
+# Ensure raster layers = number of days
+stopifnot(length(time_vals) == nlyr(r))
+
+# Monthly grouping index (first day of month for each daily layer)
+month_index <- floor_date(time_vals, "month")
+
+# -----------------------------
+# 4. Read ROI with sf and Match CRS
+# -----------------------------
+shp <- st_read("County_Boundaries.shp")
+
+# Assumption: original CRS = Web Mercator (EPSG:3857) 
+# Change if your shapefile is in another CRS
+st_crs(shp) <- 3857           
+shp <- st_transform(shp, 4326) # reproject to lon/lat (EPSG:4326)
+
+# Shift to 0–360 domain (only if raster is in 0–360 longitudes!)
+shp_shift <- shp
+st_geometry(shp_shift) <- st_geometry(shp_shift) + c(360,0)
+st_crs(shp_shift) <- crs(r)   # ensure CRS matches raster
+
+# -----------------------------
+# 5. Crop, Mask & Aggregate
+# -----------------------------
+# Crop to ROI extent
+r_crop <- crop(r, vect(shp_shift))
+# Mask outside ROI
+r_mask <- mask(r_crop, vect(shp_shift))
+# Aggregate daily → monthly mean
+r_monthly <- tapp(r_mask, month_index, fun = mean, na.rm = TRUE)
+# Rename layers as YYYY-MM
+names(r_monthly) <- format(unique(month_index), "%Y-%m")
+
+# -----------------------------
+# 6. Convert Raster to Data Frame
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+# Wide → long for ggplot
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "co2fire") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+
+# -----------------------------
+# 7. Aggregate for Maps & Line Plot
+# -----------------------------
+# Collapse across years → mean per pixel per month
+r_df_monthly <- r_df_long %>%
+  group_by(x, y, Month_Name) %>%
+  summarise(co2fire = mean(co2fire, na.rm = TRUE), .groups = "drop") %>%
+  filter(co2fire > 0)   # drop <=0 to avoid log scale errors
+
+# Global min/max for consistent color scale
+legend_min <- min(r_df_monthly$co2fire, na.rm = TRUE)
+legend_max <- max(r_df_monthly$co2fire, na.rm = TRUE)
+
+# Spatial mean per month (for line plot)
+monthly_mean <- r_df_monthly %>%
+  group_by(Month_Name) %>%
+  summarise(co2fire_mean = mean(co2fire, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Month_Name = factor(Month_Name, levels = month.abb))
+
+# -----------------------------
+# 8. Prepare ROI for Map Overlay
+# -----------------------------
+roi_shift <- shp
+st_geometry(roi_shift) <- st_geometry(roi_shift) + c(360, 0)
+roi_bbox <- st_bbox(roi_shift)
+
+# -----------------------------
+# 9. Map Plot (12 Panels, Jan–Dec)
+# -----------------------------
+colors <- brewer.pal(5, "YlOrRd")  # yellow→red palette
+
+map_plot <- ggplot(r_df_monthly, aes(x = x, y = y, fill = co2fire)) +
+  geom_tile(alpha = 0.9) +
+  geom_sf(data = roi_shift, inherit.aes = FALSE, fill = NA, color = "black", linewidth = 0.2) +
+  coord_sf(xlim = c(roi_bbox["xmin"], roi_bbox["xmax"]),
+           ylim = c(roi_bbox["ymin"], roi_bbox["ymax"])) +
+  scale_fill_gradientn(
+    colors = colors,
+    na.value = "transparent",
+    trans = "log10",                         # log scale
+    limits = c(legend_min, legend_max),      # fixed legend
+    name = "CO2 Flux (kg/m²/s)",
+    breaks = trans_breaks("log10", function(x) 10^x)
+  ) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(
+    title = "(A) Monthly Wildfire CO2 Flux (2023–2024)",
+    x = "Longitude", y = "Latitude",
+    caption = "GFAS: https://atmosphere.copernicus.eu/data"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 8),
+    plot.title  = element_text(hjust = 0, size = 12, face = "bold", color = "black"),
+    axis.text   = element_text(color = "black", size = 8),
+    axis.title  = element_text(color = "black", size = 8),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(3, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 8, face = "bold", color = "black"),
+    legend.text  = element_text(size = 8, color = "black")
+  )
+
+# -----------------------------
+# 10. Line Plot (Monthly Mean)
+# -----------------------------
+line_min <- min(monthly_mean$co2fire_mean[monthly_mean$co2fire_mean > 0], na.rm = TRUE)
+line_max <- max(monthly_mean$co2fire_mean, na.rm = TRUE)
+
+# Compute log scale breaks
+exp_min <- floor(log10(line_min)); exp_max <- ceiling(log10(line_max))
+line_breaks <- 10^(exp_min:exp_max)
+
+line_plot <- ggplot(monthly_mean, aes(x = Month_Name, y = co2fire_mean, group = 1)) +
+  geom_line(color = "red", size = 1) +
+  geom_point(color = "blue", size = 2) +
+  scale_y_log10(limits = c(line_min, line_max), breaks = line_breaks, labels = scientific) +
+  labs(
+    title = "(B) Mean CO2 Flux per Month",
+    x = NULL,
+    y = expression("CO"[2]*" Wildfire Flux (kg "~m^-2~s^-1*")")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    plot.title  = element_text(hjust = 0, size = 12, face = "bold", color = "black"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+    axis.text.y = element_text(color = "black"),
+    axis.ticks  = element_line(size = 0.1, color = "black")
+  )
+
+# -----------------------------
+# 11. Combine Map + Line Plot
+# -----------------------------
+line_plot_fixed <- line_plot + theme(aspect.ratio = 3)
+
+combined_plot <- plot_grid(
+  map_plot, line_plot_fixed,
+  ncol = 2, rel_widths = c(3, 0.85),
+  align = "h", axis = "tb"
+)
+
+# -----------------------------
+# 12. Save Final Figure
+# -----------------------------
+ggsave(
+  filename = "CO2_flux_maps_LA1.png",
+  plot = combined_plot,
+  width = 16, height = 10, dpi = 300
+)
+
+#############################################
+# End of Script
+#############################################
