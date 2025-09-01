@@ -1,12 +1,12 @@
 # Geo_Solution12
-🚀 Excited to share a new YouTube tutorial I created for students and researchers working with climate and wildfire data! 🌍🔥
+🌍 Wildfire CO2 Flux Analysis in the Democratic Republic of the Congo (2023–2024) 🔥
 
-Many struggle with extracting information from NetCDF files, especially for GFAS (Global Fire Assimilation System) Wildfire CO₂ data. To help, I’ve made a short and practical video showing how to easily extract data, make maps, and generate graphs in R for the California region.
+I developed a workflow to analyze daily wildfire CO2 flux from GFAS NetCDF data over the Democratic Republic of the Congo. The pipeline includes reading shapefiles, preprocessing NetCDF data, aggregating daily fluxes to monthly means, converting raster data to tidy data frames, creating detailed maps and line plots, and exporting results as GeoTIFFs and CSVs for further analysis.
 
-✨ This video also shows you how to create high-quality maps and graphs that are publication-ready — no extra editing needed! 📊🗺️
+🎥 Purpose of the video: Many students and researchers struggle to extract data for their own regions of interest (ROI). This video demonstrates a step-by-step workflow to simplify the process and resolve those challenges.
 
-🎥 Watch the video here: https://www.youtube.com/watch?v=jYkEXtGevEo
+📺 Watch here: https://youtu.be/7_79G30tnzw
 
-I hope this will be a useful resource for those working in environmental science, wildfire research, remote sensing, and climate studies. 🙌
+🔔 Don’t forget to subscribe to the channel for more tutorials! 🎥✨
 
-#NetCDF #RStats #GFAS #Wildfire #CO2 #RemoteSensing #ClimateData #DataScience #Geospatial #California
+#RemoteSensing #GIS #Wildfire #CO2Flux #DataVisualization #RStats #EarthObservation #ClimateScience
