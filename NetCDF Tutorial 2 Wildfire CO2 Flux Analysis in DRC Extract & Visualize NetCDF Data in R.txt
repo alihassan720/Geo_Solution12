@@ -1,0 +1,243 @@
+#############################################################
+# Wildfire CO2 Flux Analysis (2023–2024)
+# Region of Interest: Democratic Republic of the Congo (DRC)
+# Data Source: GFAS CO2 Fire Flux (NetCDF)
+#
+# Workflow:
+#   1. Load libraries
+#   2. Read shapefile (DRC boundary)
+#   3. Load and preprocess NetCDF (daily wildfire CO2 flux)
+#   4. Aggregate daily → monthly means
+#   5. Convert raster → dataframe (tidy format)
+#   6. Create maps (monthly distribution)
+#   7. Create line plot (monthly averages)
+#   8. Export monthly rasters and CSV
+#############################################################
+
+# -----------------------------
+# 1. Load Required Packages
+# -----------------------------
+# Raster and vector handling
+library(terra)        # raster operations (NetCDF, GeoTIFF, crop, mask)
+library(sf)           # vector handling (shapefiles, reprojection)
+
+# Data manipulation
+library(dplyr)        # tidy data wrangling
+library(tidyr)        # pivot_longer for reshaping data
+library(lubridate)    # date handling (floor_date, etc.)
+
+# Visualization
+library(ggplot2)      # core plotting
+library(RColorBrewer) # color palettes
+library(ggspatial)    # north arrow, scale bar
+library(patchwork)    # combine plots side-by-side
+library(scales)       # scaling functions (e.g., log breaks)
+library(cowplot)      # flexible plot layout
+
+# -----------------------------
+# 2. Define ROI (Shapefile: DRC)
+# -----------------------------
+shpfile <- "Democratic_Republic_of_the_Congo_DIVA_GIS_State_L0_Admin_Boundaries.shp"
+roi <- vect(shpfile)   # Load as terra vector
+
+# Also read with sf for plotting
+shp <- st_read(shpfile, quiet = TRUE)
+
+# Ensure CRS is WGS84 (EPSG:4326)
+if (st_crs(shp)$epsg != 4326) {
+  shp <- st_transform(shp, 4326)
+}
+
+# -----------------------------
+# 3. Load Wildfire CO2 Flux Data
+# -----------------------------
+ncfile <- "gfas_2023_2024.nc"
+r <- rast(ncfile, subds = "co2fire")   # daily layers, 2023–2024
+
+# Define date range manually (matching NetCDF daily layers)
+start_date <- as.Date("2023-01-01")
+end_date   <- as.Date("2024-12-31")
+time_vals  <- seq.Date(start_date, end_date, by = "day")
+
+# Verify NetCDF layers = number of days
+stopifnot(length(time_vals) == nlyr(r))
+
+# Monthly index (used for aggregation)
+month_index <- floor_date(time_vals, "month")
+
+# -----------------------------
+# 4. Crop and Mask to DRC ROI
+# -----------------------------
+r_crop <- crop(r, vect(shp))   # crop extent
+r_mask <- mask(r_crop, vect(shp))  # mask outside DRC
+
+# -----------------------------
+# 5. Aggregate Daily → Monthly Mean
+# -----------------------------
+r_monthly <- tapp(r_mask, month_index, fun = mean, na.rm = TRUE)
+
+# Rename layers to YYYY-MM
+names(r_monthly) <- format(unique(month_index), "%Y-%m")
+
+# -----------------------------
+# 6. Convert Raster → Data Frame
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+# Reshape: wide → long
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "co2fire") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+
+# -----------------------------
+# 7. Summaries for Maps & Line Plot
+# -----------------------------
+# Per-pixel monthly average (across 2023–2024)
+r_df_monthly <- r_df_long %>%
+  group_by(x, y, Month_Name) %>%
+  summarise(co2fire = mean(co2fire, na.rm = TRUE), .groups = "drop") %>%
+  filter(co2fire > 0)   # drop zero or negative values (for log scale)
+
+# Spatial mean per month (for line plot)
+monthly_mean <- r_df_monthly %>%
+  group_by(Month_Name) %>%
+  summarise(co2fire_mean = mean(co2fire, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Month_Name = factor(Month_Name, levels = month.abb))
+
+# -----------------------------
+# 8. Create Map (12 Panels: Jan–Dec)
+# -----------------------------
+# Define color palette
+colors <- brewer.pal(5, "YlOrRd")
+
+# Global legend limits
+full_min <- min(r_df_monthly$co2fire, na.rm = TRUE)
+full_max <- max(r_df_monthly$co2fire, na.rm = TRUE)
+#Find nearest powers of 10
+min_pow <- floor(log10(full_min))   # -10
+max_pow <- ceiling(log10(full_max)) # -6
+#Generate breaks across that range
+breaks <- 10^(min_pow:max_pow)
+print(breaks)
+map_plot <- ggplot(r_df_monthly, aes(x = x, y = y, fill = co2fire)) +
+  geom_raster() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    colors = rev(colors),
+    trans = "log10",
+    limits = c(1e-10, full_max),
+    #limits = c(full_min, full_max),
+    breaks  = c(1e-10, 1e-9, 1e-8, 1e-7, 1e-6),
+    #breaks = breaks,
+    labels = scales::scientific_format(digits = 2),
+    name = "CO2 Flux (kg/m²/s)"
+  ) +
+  guides(fill = guide_colorbar(reverse = TRUE)) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr",
+    height = unit(0.6, "cm"),
+    width  = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Wildfire CO2 Flux (2023–2024)\nDemocratic Republic of the Congo",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GFAS (Copernicus Atmosphere Monitoring Service)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 8),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black",face = "bold"),
+    axis.text   = element_text(color = "black", size = 9),
+    axis.title  = element_text(color = "black", size = 9,face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(3, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 8, face = "bold", color = "black"),
+    legend.text  = element_text(size = 8, color = "black")
+  )
+
+# -----------------------------
+# 9. Line Plot (Monthly Means)
+# -----------------------------
+line_plot <- ggplot(monthly_mean, aes(x = Month_Name, y = co2fire_mean, group = 1)) +
+  geom_line(color = "red", size = 1) +
+  geom_point(color = "blue", size = 2) +
+  labs(
+    title = "(B) Mean CO2 Flux per Month",
+    x = NULL,
+    y = expression("CO"[2]*" Wildfire Flux (kg "~m^-2~s^-1*")")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black",face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1,face = "bold"),
+    axis.title.y  = element_text(color = "black", size = 12,face = "bold"),
+    axis.text.y = element_text(face = "bold",color = "black"),
+    axis.ticks  = element_line(size = 0.1, color = "black")
+  )
+
+
+line_plot_fixed <- line_plot + theme(aspect.ratio = 3)
+
+# -----------------------------
+# 10. Combine and Save Plots
+# -----------------------------
+combined_plot <- plot_grid(
+  map_plot, line_plot_fixed,
+  ncol = 2, rel_widths = c(3, 0.85),
+  align = "h", axis = "tb"
+)
+
+ggsave(
+  filename = "CO2_flux_maps_DRC.png",
+  plot = combined_plot,
+  width = 16, height = 10, dpi = 300
+)
+
+# -----------------------------
+# 11. Export Monthly Rasters (GeoTIFFs)
+# -----------------------------
+months <- unique(r_df_long$Year_Month_Label)
+
+for (m in months) {
+  df_month <- r_df_long %>%
+    filter(Year_Month_Label == m) %>%
+    select(x, y, co2fire)
+  
+  r_out <- rast(df_month, type = "xyz", crs = "EPSG:4326")
+  out_file <- paste0("CO2fire_", m, ".tif")
+  writeRaster(r_out, out_file, overwrite = TRUE)
+}
+
+# -----------------------------
+# 12. Export as CSV (Point Values Inside DRC)
+# -----------------------------
+r_df_points <- r_df_long %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326)  # convert to sf points
+
+# Ensure CRS match
+r_df_points <- st_transform(r_df_points, st_crs(shp))
+
+# Intersect points with ROI
+r_df_points_drc <- st_intersection(r_df_points, shp)
+
+# Drop geometry and save
+r_df_points_csv <- r_df_points_drc %>% st_drop_geometry()
+write.csv(r_df_points_csv, "CO2fire_DRC_monthly.csv", row.names = FALSE)
+
+#############################################################
+# End of Script
+#############################################################
