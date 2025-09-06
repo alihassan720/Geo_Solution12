@@ -1,0 +1,237 @@
+#############################################################
+# Wildfire CO2 Flux Analysis (GFAS 2023–2024)
+# Study Region: India (ROI from shapefile)
+# Author: Ali Hassan Shabbir
+#############################################################
+
+# -----------------------------
+# 1. Load Required Packages
+# -----------------------------
+library(terra)        
+library(sf)           
+
+# Data manipulation
+library(dplyr)        
+library(tidyr)        
+library(lubridate)    
+
+# Visualization
+library(ggplot2)      
+library(RColorBrewer) 
+library(ggspatial)    
+library(patchwork)    
+library(scales)       
+library(cowplot)      
+# -----------------------------
+# 2. Define ROI (Shapefile: India)
+# -----------------------------
+shpfile <- "gadm41_IND_0.shp"
+roi <- vect(shpfile)   # Load shapefile as terra vector
+
+# Also read with sf for plotting
+shp <- st_read(shpfile, quiet = TRUE)
+
+# Ensure CRS is WGS84 (EPSG:4326)
+if (st_crs(shp)$epsg != 4326) {
+  shp <- st_transform(shp, 4326)
+}
+
+# -----------------------------
+# 3. Load Wildfire CO2 Flux Data
+# -----------------------------
+# Load GFAS NetCDF data (subdataset = co2fire)
+ncfile <- "gfas_2023_2024.nc"
+# List all subdatasets (variables)
+subds <- sds(ncfile)
+subds
+r <- rast(ncfile, subds = "co2fire")   # daily layers, 2023–2024
+
+# -----------------------------
+# 4. Crop and Mask to ROI
+# -----------------------------
+r_crop <- crop(r, vect(shp))    # crop to bounding box of ROI
+r_mask <- mask(r_crop, vect(shp))  # mask outside country boundary
+
+# -----------------------------
+# 5. Aggregate Daily → Monthly Mean
+# -----------------------------
+# Create correct daily date sequence (leap year 2024 included = 731 days)
+start_date <- as.Date("2023-01-01")
+end_date   <- as.Date("2024-12-31")
+time_vals  <- seq.Date(start_date, end_date, by = "day")
+
+# Check that number of dates = number of raster layers
+stopifnot(length(time_vals) == nlyr(r_mask))
+
+# Ordered month labels (Jan 2023 → Dec 2024 = 24 months)
+month_labels <- format(seq.Date(start_date, end_date, by = "month"), "%Y-%m")
+
+# Create integer grouping index (maps each day → month 1..24)
+group_idx <- as.integer(factor(format(time_vals, "%Y-%m"), levels = month_labels))
+
+# Aggregate daily layers into monthly mean
+r_monthly <- tapp(r_mask, index = group_idx, fun = mean, na.rm = TRUE)
+
+# Assign correct month names
+names(r_monthly) <- month_labels
+
+# -----------------------------
+# 6. Convert Raster → Data Frame
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+# Reshape: wide → long format for ggplot
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "co2fire") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+
+# -----------------------------
+# 7. Summaries for Maps & Line Plot
+# -----------------------------
+# Per-pixel monthly average (across 2023–2024)
+r_df_monthly <- r_df_long %>%
+  group_by(x, y, Month_Name) %>%
+  summarise(co2fire = mean(co2fire, na.rm = TRUE), .groups = "drop") %>%
+  filter(co2fire > 0)   # drop zero/negative (for log scale)
+
+# Spatial monthly mean (for line plot)
+monthly_mean <- r_df_monthly %>%
+  group_by(Month_Name) %>%
+  summarise(co2fire_mean = mean(co2fire, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Month_Name = factor(Month_Name, levels = month.abb))
+
+# -----------------------------
+# 8. Create Map (12 Panels: Jan–Dec)
+# -----------------------------
+# Define color palette
+colors <- brewer.pal(5, "YlOrRd")
+
+# Global legend limits
+full_min <- min(r_df_monthly$co2fire, na.rm = TRUE)
+full_max <- max(r_df_monthly$co2fire, na.rm = TRUE)
+#Find nearest powers of 10
+min_pow <- floor(log10(full_min))   # -10
+max_pow <- ceiling(log10(full_max)) # -6
+#Generate breaks across that range
+breaks <- 10^(min_pow:max_pow)
+print(breaks)
+
+map_plot <- ggplot(r_df_monthly, aes(x = x, y = y, fill = co2fire)) +
+  geom_raster() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    colors = rev(colors),
+    trans = "log10",
+    limits = c(1e-11, full_max),
+    breaks  = c(1e-11, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5),
+    labels = scales::scientific_format(digits = 2),
+    name = "CO2 Flux (kg/m²/s)"
+  ) +
+  guides(fill = guide_colorbar(reverse = TRUE)) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr",
+    height = unit(0.6, "cm"),
+    width  = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Wildfire CO2 Flux (2023–2024)\nIndia",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GFAS (Copernicus Atmosphere Monitoring Service)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 8),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 9),
+    axis.title  = element_text(color = "black", size = 9, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(3, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 8, face = "bold", color = "black"),
+    legend.text  = element_text(size = 8, color = "black")
+  )
+
+# -----------------------------
+# 9. Line Plot (Monthly Means)
+# -----------------------------
+line_plot <- ggplot(monthly_mean, aes(x = Month_Name, y = co2fire_mean, group = 1)) +
+  geom_line(color = "red", linewidth = 1) +
+  geom_point(color = "blue", size = 2) +
+  labs(
+    title = "(B) Mean CO2 Flux per Month",
+    x = NULL,
+    y = expression("CO"[2]*" Wildfire Flux (kg "~m^-2~s^-1*")")
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.title.y  = element_text(color = "black", size = 12, face = "bold"),
+    axis.text.y = element_text(face = "bold", color = "black"),
+    axis.ticks  = element_line(size = 0.1, color = "black")
+  )
+
+line_plot_fixed <- line_plot + theme(aspect.ratio = 3)
+
+# -----------------------------
+# 10. Combine and Save Plots
+# -----------------------------
+combined_plot <- plot_grid(
+  map_plot, line_plot_fixed,
+  ncol = 2, rel_widths = c(3, 0.85),
+  align = "h", axis = "tb"
+)
+
+ggsave(
+  filename = "CO2_flux_maps_IND.jpeg",
+  plot = combined_plot,
+  width = 16, height = 10, dpi = 300
+)
+
+# -----------------------------
+# 11. Export Monthly Rasters (GeoTIFFs)
+# -----------------------------
+months <- unique(r_df_long$Year_Month_Label)
+
+for (m in months) {
+  df_month <- r_df_long %>%
+    filter(Year_Month_Label == m) %>%
+    select(x, y, co2fire)
+  
+  r_out <- rast(df_month, type = "xyz", crs = "EPSG:4326")
+  out_file <- paste0("CO2fire_", m, ".tif")
+  writeRaster(r_out, out_file, overwrite = TRUE)
+}
+
+# -----------------------------
+# 12. Export as CSV (Point Values Inside ROI)
+# -----------------------------
+r_df_points <- r_df_long %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326)  # convert to sf points
+
+# Ensure CRS match
+r_df_points <- st_transform(r_df_points, st_crs(shp))
+
+# Intersect points with ROI
+r_df_points_roi <- st_intersection(r_df_points, shp)
+
+# Drop geometry and save
+r_df_points_csv <- r_df_points_roi %>% st_drop_geometry()
+write.csv(r_df_points_csv, "CO2fire_IND_monthly.csv", row.names = FALSE)
+
+#############################################################
+# End of Script
+#############################################################
