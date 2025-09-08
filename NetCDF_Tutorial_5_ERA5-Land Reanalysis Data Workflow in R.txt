@@ -1,0 +1,330 @@
+#############################################################
+# ERA5-Land hourly data from 1950 to present
+# Study Region: India (ROI from shapefile)
+# Author: Ali Hassan Shabbir
+#
+# This script processes ERA5-Land climate reanalysis data 
+# (temperature, t2m) for India. It:
+#   1. Loads ERA5-Land NetCDF data
+#   2. Crops and masks data to India ROI
+#   3. Converts hourly/monthly data into usable time-series
+#   4. Aggregates monthly averages
+#   5. Creates maps and line plots for visualization
+#   6. Exports rasters and tabular data
+#
+#############################################################
+
+# -----------------------------
+# 1. Load Required Packages
+# -----------------------------
+library(terra)        # for raster data handling
+library(sf)           # for vector shapefile handling
+
+# Data manipulation
+library(dplyr)        # tidy data wrangling
+library(tidyr)        # reshaping data
+library(lubridate)    # handling dates
+
+# Visualization
+library(ggplot2)      # plotting
+library(RColorBrewer) # color palettes
+library(ggspatial)    # scalebar and north arrow
+library(patchwork)    # combining plots
+library(scales)       # scaling helpers
+library(cowplot)      # combining plots
+library(ncdf4)        # reading NetCDF structure
+library(data.table)   # efficient large table processing
+library(fst)          # fast storage of large data
+
+# -----------------------------
+# 2. Define ROI (Shapefile: India)
+# -----------------------------
+shpfile <- "gadm41_IND_0.shp"
+roi <- vect(shpfile)   # Load shapefile as terra vector
+shp <- st_read(shpfile, quiet = TRUE)
+
+# Ensure shapefile is in geographic coordinates (EPSG:4326)
+if (st_crs(shp)$epsg != 4326) {
+  shp <- st_transform(shp, 4326)
+}
+
+# -----------------------------
+# 3. Load ERA5-Land NetCDF
+# -----------------------------
+ncfile <- "ERA5-Land monthly averaged data.nc"
+
+# List all subdatasets (available variables in the NetCDF)
+subds <- sds(ncfile)
+subds
+
+# Load temperature at 2 meters (t2m) from ERA5-Land
+r <- rast(ncfile, subds = "t2m")   # monthly layers, 1950–present
+
+# -----------------------------
+# 4. Spatial Subset to ROI
+# -----------------------------
+# Get bounding box of India
+bb <- ext(roi)
+
+# Crop by bounding box only (faster than masking directly)
+terraOptions(todisk = TRUE, memfrac = 0.5)  # control memory usage
+r_crop <- crop(r, bb)
+crs(r_crop) <- "EPSG:4326"
+
+# Mask to exact India polygon
+r_mask <- mask(r_crop, roi)
+
+# -----------------------------
+# 5. Extract Time Information
+# -----------------------------
+# Open NetCDF directly for metadata
+nc <- nc_open(ncfile)
+
+# Extract time dimension values
+time_vals  <- nc$dim$valid_time$vals
+time_units <- nc$dim$valid_time$units
+nc_close(nc)
+
+# Parse origin from units string
+origin <- as.Date(sub("seconds since ", "", time_units))
+
+# Convert seconds → days
+dates <- origin + time_vals / (24*60*60)
+
+# Define start and end dates of dataset
+start_date <- min(dates)
+end_date   <- max(dates)
+
+# -----------------------------
+# 6. Aggregate Daily → Monthly Mean
+# -----------------------------
+# Create monthly time sequence
+start_date <- as.Date("1950-01-01")
+end_date   <- as.Date("2025-08-01")
+time_vals  <- seq.Date(start_date, end_date, by = "month")
+
+# Check time dimension = raster layers
+stopifnot(length(time_vals) == nlyr(r_mask))
+
+# Generate month labels (e.g., "1950-01", "1950-02", …)
+month_labels <- format(seq.Date(start_date, end_date, by = "month"), "%Y-%m")
+
+# Create grouping index to map layers → months
+group_idx <- as.integer(factor(format(time_vals, "%Y-%m"), levels = month_labels))
+
+# Aggregate rasters into monthly mean
+r_monthly <- tapp(r_mask, index = group_idx, fun = mean, na.rm = TRUE)
+
+# Assign correct names
+names(r_monthly) <- month_labels
+
+# -----------------------------
+# 7. Convert Raster → Data Frame
+# -----------------------------
+# Convert raster layers into a dataframe
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+# Reshape from wide (each column = month) to long
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "t2m") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+
+# -----------------------------
+# 8. Summaries for Maps & Line Plot
+# -----------------------------
+# Per-pixel monthly average (spatial maps)
+r_df_monthly <- r_df_long %>% 
+  group_by(x, y, Month_Name) %>%
+  summarise(t2m = mean(t2m, na.rm = TRUE), .groups = "drop") %>%
+  mutate(t2m = t2m - 273.15)  # Convert Kelvin → Celsius
+
+# Monthly mean over India (line plot time series)
+r_df_monthly_line_plot <- r_df_long %>%
+  group_by(Year, Month_Name) %>%
+  summarise(t2m = mean(t2m, na.rm = TRUE), .groups = "drop") %>%
+  mutate(t2m = t2m - 273.15) %>%
+  mutate(Year = as.integer(Year))
+
+# -----------------------------
+# 9. Mapping Setup
+# -----------------------------
+n_bins <- 12   # number of bins for color breaks
+
+# Create equal-width bins
+breaks_equal <- seq(
+  min(r_df_monthly$t2m, na.rm = TRUE),
+  max(r_df_monthly$t2m, na.rm = TRUE),
+  length.out = n_bins + 1
+)
+
+# Assign each cell to a temperature bin
+r_df_monthly1 <- r_df_monthly %>%
+  mutate(
+    t2m_bin = cut(
+      t2m,
+      breaks = breaks_equal,
+      include.lowest = TRUE,
+      right = TRUE
+    )
+  )
+
+# Generate color palette
+colors <- colorRampPalette(rev(brewer.pal(11, "RdBu")))(n_bins)
+
+# -----------------------------
+# 10. Map Plot (Facetted by Month)
+# -----------------------------
+map_plot = ggplot(r_df_monthly1, aes(x = x, y = y, fill = t2m_bin)) +
+  geom_tile() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_manual(
+    values = colors,
+    name = "Temp.(°C)",
+    drop = FALSE
+  ) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr",
+    height = unit(0.6, "cm"),
+    width  = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Mean Temperature (°C) (1950–2025)\nIndia",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: ERA5-Land hourly data from 1950 to present"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 8),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 9),
+    axis.title  = element_text(color = "black", size = 9, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.7, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 8, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+# -----------------------------
+# 11. Line Plot (Monthly Means by Year)
+# -----------------------------
+# First line plot (all years by month)
+line_plot <- ggplot(r_df_monthly_line_plot, aes(x = Year, y = t2m)) +
+  geom_line(color = "grey", linewidth = 1.3) +
+  geom_point(color = "black", size = 1) +
+  facet_wrap(~Month_Name, ncol = 3) +
+  scale_x_continuous(breaks = seq(min(r_df_monthly_line_plot$Year), 
+                                  max(r_df_monthly_line_plot$Year), by = 5)) +
+  labs(
+    title = "Monthly Mean Temperature (°C) Over Years",
+    x = "Year",
+    y = "Temperature (°C)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.title  = element_text(color = "black", size = 12, face = "bold"),
+    axis.text.y = element_text(face = "bold", color = "black"),
+    axis.ticks  = element_line(size = 0.1, color = "black")
+  )
+
+# Refined version (highlight 2025 vs other years)
+r_df_plot <- r_df_monthly_line_plot %>%
+  filter(Year %% 5 == 0 | Year == 2025) %>%
+  mutate(line_color = ifelse(Year == 2025, "2025", "Other Years"))
+
+line_plot <- ggplot(r_df_plot, aes(x = Month_Name, y = t2m, group = Year, color = line_color)) +
+  geom_line(aes(size = line_color)) +
+  geom_point(aes(size = line_color)) +
+  scale_color_manual(values = c("Other Years" = "grey", "2025" = "black"), name = "Year Group") +
+  scale_size_manual(values = c("Other Years" = 0.5, "2025" = 1.2), guide = "none") +
+  labs(
+    title = "(B) Monthly Mean Temperature (°C) by Year",
+    x = "Month",
+    y = "Temperature (°C)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.title = element_text(color = "black", size = 12, face = "bold"),
+    axis.text.y = element_text(face = "bold", color = "black"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"),
+    legend.background = element_blank(),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+line_plot_fixed <- line_plot + theme(aspect.ratio = 3)
+
+# -----------------------------
+# 12. Combine and Save Plots
+# -----------------------------
+combined_plot <- plot_grid(
+  map_plot, line_plot_fixed,
+  ncol = 2, rel_widths = c(3, 0.85),
+  align = "h", axis = "tb"
+)
+
+ggsave(
+  filename = "CO2_flux_maps_IND.jpeg",
+  plot = combined_plot,
+  width = 16, height = 10, dpi = 300
+)
+
+# -----------------------------
+# 13. Export Monthly Rasters (GeoTIFFs)
+# -----------------------------
+months <- unique(r_df_long$Year_Month_Label)
+
+for (m in months) {
+  df_month <- r_df_long %>%
+    filter(Year_Month_Label == m) %>%
+    select(x, y, t2m)
+  
+  # Convert xyz → raster
+  r_out <- rast(df_month, type = "xyz", crs = "EPSG:4326")
+  out_file <- paste0("t2m", m, ".tif")
+  writeRaster(r_out, out_file, overwrite = TRUE)
+}
+
+# -----------------------------
+# 14. Export Data as CSV/FST
+# -----------------------------
+roi_sf <- st_as_sf(roi)   # ROI polygon in sf
+
+# Convert dataframe to data.table
+dt <- as.data.table(r_df_long)
+
+# Attach ROI polygon name info
+# NOTE: roi_df must exist separately for this step
+roi_names <- paste(roi_df$GID_0, collapse = ";")
+dt[, polygons := roi_names]
+
+# Save point data as .fst (fast format)
+write_fst(dt, "r_df_points_all_polygons.fst")
+d = read_fst("r_df_points_all_polygons.fst")
+
+#############################################################
+# End of Script
+#############################################################
