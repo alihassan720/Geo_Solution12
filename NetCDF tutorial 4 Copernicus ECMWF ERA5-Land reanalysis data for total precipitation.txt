@@ -1,0 +1,243 @@
+#############################################################
+# ERA5-Land Climate Data Processing Script
+# Study Region: Pakistan (ROI from shapefile)
+# Author: Ali Hassan Shabbir
+#
+# Description:
+# This script processes ERA5-Land monthly climate reanalysis data 
+# (Total Precipitation) for Pakistan. 
+# It performs the following steps:
+#   1. Loads required R packages
+#   2. Reads shapefile (Pakistan ROI) and extracts bounding box
+#   3. Crops ERA5 NetCDF data using GDAL to match ROI extent
+#   4. Loads cropped raster data, assigns synthetic monthly dates
+#   5. Converts raster to data.table and reshapes to long format
+#   6. Calculates monthly mean precipitation across all years
+#   7. Creates faceted spatial maps and time-series plots
+#   8. Combines plots and exports to high-resolution image
+#
+# Note: The output units are total precipitation in meters (m).
+#############################################################
+
+# -----------------------------
+# 1. Load Required Packages
+# -----------------------------
+library(terra)        # Raster data handling (crop, mask, read/write)
+library(sf)           # Vector/shapefile handling
+library(dplyr)        # Data manipulation (filter, summarise, mutate)
+library(tidyr)        # Reshape data (pivot/melt)
+library(lubridate)    # Date handling (year, month extraction)
+library(ggplot2)      # Visualization
+library(RColorBrewer) # Color palettes
+library(ggspatial)    # Scale bar, north arrow
+library(patchwork)    # Combine multiple ggplots
+library(scales)       # Scaling helpers (e.g., pretty_breaks)
+library(cowplot)      # Advanced plot combination
+library(ncdf4)        # Work with NetCDF metadata
+library(data.table)   # High-performance data manipulation
+library(fst)          # Fast saving/loading of large datasets
+library(fasterRaster) # Faster raster operations (optional)
+library(grid)         # Low-level grid functions for plot layout
+library(gdalUtilities)
+# -----------------------------
+# 2. Read Shapefile & Extract Bounding Box
+# -----------------------------
+shpfile <- "gadm41_PAK_0.shp"
+roi <- vect(shpfile)
+
+# Extract bounding box (xmin, xmax, ymin, ymax)
+bb <- ext(roi)
+xmin <- bb[1]; xmax <- bb[2]
+ymin <- bb[3]; ymax <- bb[4]
+
+# -----------------------------
+# 3. Crop ERA5 NetCDF using GDAL Warp
+# -----------------------------
+ncfile <- "ERA5-Land monthly averaged data from 1950 to present Pakistan.nc"
+out_nc <- "ERA5-Pakistan.nc"
+
+suppressWarnings(
+  gdalwarp(
+    srcfile = ncfile,
+    dstfile = out_nc,
+    te = c(xmin, ymin, xmax, ymax),  # bounding box from shapefile
+    of = "NetCDF",
+    overwrite = TRUE
+  )
+)
+
+# Read shapefile again for plotting
+roi <- vect(shpfile)
+shp <- st_read(shpfile, quiet = TRUE)
+
+# Reproject if not EPSG:4326
+if (st_crs(shp)$epsg != 4326) {
+  shp <- st_transform(shp, 4326)
+}
+
+# -----------------------------
+# 4. Load Cropped ERA5 Raster
+# -----------------------------
+r <- rast(out_nc)
+
+# Crop & mask to exact ROI (more precise than bbox)
+bb <- ext(roi)
+terraOptions(todisk = TRUE, memfrac = 0.5)
+r_crop <- crop(r, bb)
+crs(r_crop) <- "EPSG:4326"
+r_mask <- mask(r_crop, roi)
+
+# -----------------------------
+# 5. Assign Monthly Dates to Layers
+# -----------------------------
+n_layers <- nlyr(r_mask)
+start_date <- as.Date("1950-01-01")
+dates <- seq(from = start_date, by = "month", length.out = n_layers)
+names(r_mask) <- as.character(dates)
+time(r_mask) <- dates
+
+# -----------------------------
+# 6. Convert Raster to Long Data Table
+# -----------------------------
+r_df <- as.data.frame(r_mask, xy = TRUE)
+dt <- as.data.table(r_df)
+
+dt_long <- melt(
+  dt,
+  id.vars = c("x", "y"),
+  variable.name = "date",
+  value.name = "value"
+)
+
+# Convert date column & add time components
+dt_long[, date := as.Date(date)]
+dt_long[, Year := as.integer(format(date, "%Y"))]
+dt_long[, Month := as.integer(format(date, "%m"))]
+dt_long[, Month_Name := format(date, "%b")] # Abbreviated month names
+
+# -----------------------------
+# 7. Aggregate Monthly Means (Across Years)
+# -----------------------------
+dt_monthly <- dt_long[, .(
+  value_mean = mean(value, na.rm = TRUE)
+), by = .(x, y, Month, Month_Name)]
+
+dt_monthly[, Month_Name := factor(Month_Name,
+                                  levels = month.abb,
+                                  ordered = TRUE)]
+
+# -----------------------------
+# 8. Define Color Scales for Maps
+# -----------------------------
+vmin <- min(dt_monthly$value_mean)
+vmax <- max(dt_monthly$value_mean)
+
+breaks <- classInt::classIntervals(
+  dt_monthly$value_mean, n = 18, style = "pretty"
+)$brks
+# Generate color palette
+cols <- colorRampPalette(rev(RColorBrewer::brewer.pal(
+  11, "Spectral"
+)))
+# Combine multiple palettes for a smooth gradient
+pal1 <- brewer.pal(9, "YlGnBu")
+pal2 <- brewer.pal(9, "Spectral")
+pal3 <- brewer.pal(9, "BrBG")
+pal4 <- brewer.pal(9, "RdYlGn")
+cols <- colorRampPalette(c(pal1, pal2, pal3, pal4))
+
+# -----------------------------
+# 9. Create Faceted Map Plot
+# -----------------------------
+map_plot = ggplot(dt_monthly, aes(x = x, y = y, fill = value_mean)) +
+  geom_tile(alpha = 0.9) +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "TP(m)",
+    colours = cols(15),
+    limits = c(vmin, vmax),
+    breaks = breaks
+  ) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tl", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Mean Total Precipitation (m)\n(1950–2025) Pakistan",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: ERA5-Land hourly data from 1950 to present"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 8),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 9),
+    axis.title  = element_text(color = "black", size = 9, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(2.2, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 8, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+# -----------------------------
+# 10. Create Line Plots for Temporal Trends
+# -----------------------------
+r_df_monthly_line_plot <- dt_long %>%
+  group_by(Year, Month_Name) %>%
+  summarise(tpm = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Year = as.integer(Year),
+         Month_Name = factor(Month_Name, levels = month.abb, ordered = TRUE))
+
+# Highlight 2025
+r_df_plot <- r_df_monthly_line_plot %>%
+  filter(Year %% 5 == 0 | Year == 2025) %>%
+  mutate(line_color = ifelse(Year == 2025, "2025", "Other Years"))
+
+line_plot <- ggplot(r_df_plot, aes(x = Month_Name, y = tpm, group = Year, color = line_color)) +
+  geom_line(aes(size = line_color)) +
+  geom_point(aes(size = line_color)) +
+  scale_color_manual(values = c("Other Years" = "grey", "2025" = "black"), name = "Year Group") +
+  scale_size_manual(values = c("Other Years" = 0.5, "2025" = 1.2), guide = "none") +
+  labs(
+    title = "(B) Monthly Mean Total Precipitation (m)\n by Year",
+    x = "Month", y = "Total Precipitation (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.title = element_text(color = "black", size = 12, face = "bold"),
+    axis.text.y = element_text(face = "bold", color = "black"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"),
+    legend.background = element_blank(),
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+# Combine plots side by side
+line_plot_fixed <- line_plot + theme(aspect.ratio = 3)
+combined_plot <- plot_grid(
+  map_plot, line_plot_fixed,
+  ncol = 2, rel_widths = c(3, 0.85),
+  align = "h", axis = "tb"
+)
+
+# -----------------------------
+# 11. Save Final Output
+# -----------------------------
+ggsave(
+  filename = "CO2_flux_maps_PK.jpeg",
+  plot = combined_plot,
+  width = 16, height = 10, dpi = 300
+)
