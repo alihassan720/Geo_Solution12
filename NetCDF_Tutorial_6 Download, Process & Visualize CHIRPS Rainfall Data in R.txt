@@ -1,0 +1,316 @@
+# ==========================================================
+# Complete CHIRPS Rainfall Processing and Visualization Script
+# ==========================================================
+# This script automates the process of:
+#  1. Downloading CHIRPS v3.0 monthly rainfall NetCDF data (2022–2025).
+#  2. Cropping and masking data to a Region of Interest (ROI) shapefile.
+#  3. Calculating monthly precipitation means, anomalies, and intensity indices.
+#  4. Generating high-quality faceted maps and line plots for visualization.
+#  5. Saving combined plots as publication-quality figures.
+# ==========================================================
+
+# -----------------------------
+# 0. Load Required Libraries
+# -----------------------------
+# Raster and vector data handling
+library(terra)        # Raster handling: crop, mask, stack
+library(sf)           # Vector data handling: read shapefiles, manage CRS
+
+# Data manipulation
+library(dplyr)        # Data wrangling: filter, mutate, summarise
+library(tidyr)        # Reshaping data: pivot_longer, pivot_wider
+library(lubridate)    # Date handling: parse, extract year-month
+library(data.table)   # Efficient large table manipulation
+library(fst)          # Fast storage of large tabular data
+
+# Visualization
+library(ggplot2)      # Data visualization
+library(RColorBrewer) # Predefined color palettes
+library(ggspatial)    # Scale bar and north arrow annotations
+library(patchwork)    # Combine multiple ggplots
+library(scales)       # Nice scaling of axes/legends
+library(cowplot)      # Advanced plot combining (plot_grid)
+library(grid)         # Low-level grid graphics, unit() function
+
+# Other
+library(ncdf4)        # Read NetCDF structure
+library(classInt)     # Compute classification intervals for colors
+
+# -----------------------------
+# 1. Define Years and Download URLs
+# -----------------------------
+years <- 2022:2025
+
+# CHIRPS v3.0 monthly NetCDF data URL template
+urls <- paste0(
+  "https://data.chc.ucsb.edu/products/CHIRPS/v3.0/monthly/global/netcdf/by_year/chirps-v3.0.",
+  years,
+  ".monthly.nc"
+)
+
+# -----------------------------
+# 2. Create Folder for Downloads
+# -----------------------------
+dir.create("CHIRPS_NC", showWarnings = FALSE)
+
+# -----------------------------
+# 3. Download NetCDF Files
+# -----------------------------
+# Downloads all yearly NetCDFs into CHIRPS_NC folder
+for (i in seq_along(urls)) {
+  destfile <- file.path("CHIRPS_NC", paste0("chirps-v3.0.", years[i], ".monthly.nc"))
+  download.file(urls[i], destfile, mode = "wb")
+  message("Downloaded: ", destfile)
+}
+
+# -----------------------------
+# 4. List NetCDF Files in Folder
+# -----------------------------
+nc_files <- list.files( pattern = "\\.nc$", full.names = TRUE)
+
+# -----------------------------
+# 5. Read ROI Shapefile and Convert to SpatVector
+# -----------------------------
+# Replace "gadm41_PAK_0.shp" with your ROI shapefile path
+roi <- st_read("gadm41_PAK_0.shp", quiet = TRUE)
+roi_vect <- vect(roi)
+
+# -----------------------------
+# 6. Read, Crop, Mask, and Store Rasters + Dates
+# -----------------------------
+rasters_list <- list()
+dates_list   <- list()
+
+for (i in seq_along(nc_files)) {
+  r <- rast(nc_files[i])                    # Read NetCDF file as raster
+  roi_vect_proj <- project(roi_vect, crs(r)) # Match ROI CRS to raster
+  
+  t <- time(r)                              # Extract time dimension
+  
+  r_cropped <- crop(r, roi_vect_proj)       # Crop to ROI extent
+  r_masked  <- mask(r_cropped, roi_vect_proj) # Mask outside ROI
+  
+  rasters_list[[i]] <- r_masked
+  dates_list[[i]]   <- t
+}
+
+# -----------------------------
+# 7. Combine All Rasters into One Multi-layer Raster
+# -----------------------------
+r_stack <- rast(rasters_list)
+
+# -----------------------------
+# 8. Generate Monthly Time Sequence
+# -----------------------------
+start_date <- as.Date("2022-01-01")
+end_date   <- as.Date("2025-08-01")
+time_vals  <- seq.Date(start_date, end_date, by = "month")
+
+stopifnot(length(time_vals) == nlyr(r_stack))  # Sanity check
+
+month_labels <- format(time_vals, "%Y-%m")
+group_idx <- as.integer(factor(format(time_vals, "%Y-%m"), levels = month_labels))
+
+# -----------------------------
+# 9. Aggregate Rasters into Monthly Mean
+# -----------------------------
+r_monthly <- tapp(r_stack, index = group_idx, fun = mean, na.rm = TRUE)
+names(r_monthly) <- month_labels
+
+# -----------------------------
+# 10. Convert Raster to Data Frame for ggplot
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "precip") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+
+#calculate cumulative precipitation per year
+r_df_long_cusum <- r_df_long %>%
+  arrange(x, y, Year, Month) %>%  # Ensure correct order
+  group_by(x, y, Year) %>%        # Reset accumulation per year
+  mutate(precip_cum_year = cumsum(precip)) %>%
+  ungroup()
+
+# Option 1: Average cumulative precipitation across all pixels per month
+cumulative_mean <- r_df_long_cusum %>%
+  group_by(Year, Month_Name) %>%
+  summarise(mean_cum_precip = mean(precip_cum_year, na.rm = TRUE), .groups = "drop")
+
+ggplot(cumulative_mean, aes(x = Month_Name, y = mean_cum_precip, color = Year, group = Year)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Monthly Cumulative Precipitation (Average Across All Pixels)",
+    x = "Month",
+    y = "Cumulative Precipitation (mm)"
+  ) +
+  theme_minimal() +
+  theme( panel.spacing = unit(0, "pt"), 
+         panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+         plot.title = element_text(hjust = 0, size = 12, color = "black", face = "bold"), 
+         axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+         axis.title = element_text(color = "black", size = 12, face = "bold"), 
+         axis.text.y = element_text(face = "bold", color = "black"), 
+         axis.ticks = element_line(size = 0.1, color = "black"), legend.position = c(0.9, 0.9), 
+         legend.justification = c("left", "top"), 
+         legend.background = element_blank(), 
+         legend.title = element_text(face = "bold"), 
+         legend.text = element_text(size = 10) )
+
+# Calculate monthly mean precipitation across years
+r_df_monthly <- r_df_long %>% 
+  group_by(x, y, Month_Name) %>%
+  summarise(mean_precip = mean(precip, na.rm = TRUE), .groups = "drop")
+
+# Compute precipitation intensity index (PI)
+r_df_long_pi <- r_df_long %>%
+  group_by(x, y, Month_Name) %>%
+  mutate(
+    monthly_mean = mean(precip, na.rm = TRUE),
+    precip_intensity_index = (precip / monthly_mean) * 100
+  ) %>%
+  ungroup()
+#Here, PI is expressed as a percentage of the climatological mean. 
+#Values > 100% = wetter than normal, < 100% = drier than normal.
+
+# Compute precipitation anomalies (absolute + standardized z-score)
+r_df_long_anomaly <- r_df_long %>%
+  group_by(x, y, Month_Name) %>%
+  mutate(
+    climatology = mean(precip, na.rm = TRUE),
+    precip_anomaly = precip - climatology,
+    climatology_sd = sd(precip, na.rm = TRUE),
+    precip_anomaly_z = ifelse(climatology_sd == 0, NA, (precip - climatology) / climatology_sd)
+  ) %>%
+  ungroup()
+
+# -----------------------------
+# 10b. Filter for 2024 and Categorize Anomalies
+# -----------------------------
+r_df_2024 <- r_df_long_anomaly %>%
+  filter(Year == "2024")
+
+r_df_2024_cat <- r_df_2024 %>%
+  mutate(
+    anomaly_category = case_when(
+      precip_anomaly_z < 0 ~ "Drier than normal",
+      precip_anomaly_z == 0 ~ "Normal",
+      precip_anomaly_z > 0 ~ "Wetter than normal",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(anomaly_category))
+
+# Plot: Categorical anomalies
+ggplot(r_df_2024_cat, aes(x = x, y = y, fill = anomaly_category)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_manual(values = c("Drier than normal" = "blue",
+                               "Normal" = "white",
+                               "Wetter than normal" = "red")) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "2024 Monthly Precipitation Anomaly (Categorical)",
+       x = "Longitude", y = "Latitude", fill = "Anomaly")+ 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(2.2, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black") )
+
+# -----------------------------
+# 11. Prepare Color Palettes for Mean Precipitation Map
+# -----------------------------
+vmin <- min(r_df_monthly$mean_precip, na.rm = TRUE)
+vmax <- max(r_df_monthly$mean_precip, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(r_df_monthly$mean_precip, n = 18, style = "equal")$brks
+colors <- c("#EE82EE", "#8A2BE2", "#00FFFF", "#00FF00", "#FFFF00", "#FF0000")
+
+# -----------------------------
+# 12. Map Plot (Facetted by Month)
+# -----------------------------
+map_plot <- ggplot(r_df_monthly, aes(x = x, y = y, fill = mean_precip)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip.\n(mm)", colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = 1)
+  ) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Monthly Mean Precipitation (mm) \n(2022–2025) Pakistan",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: CHIRPS/v3.0") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(2.2, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black") )
+
+
+# -----------------------------
+# 13. Line Plot of Monthly Mean by Year
+# -----------------------------
+setDT(r_df_long)
+r_df_long[, Month_Name := factor(Month_Name, levels = month.abb, ordered = TRUE)]
+
+monthly_mean <- r_df_long[, .(mean_precip = mean(precip, na.rm = TRUE)), by = .(Year, Month_Name)]
+
+line_plot = ggplot(monthly_mean, aes(x = Month_Name, y = mean_precip, color = Year, group = Year)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(title = "(B) Monthly Mean Precipitation \nby Year",
+       x = "Month", y = "Mean Precipitation (mm)") +
+  theme_minimal()+ 
+  theme( panel.spacing = unit(0, "pt"), 
+         panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+         plot.title = element_text(hjust = 0, size = 12, color = "black", face = "bold"), 
+         axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+         axis.title = element_text(color = "black", size = 12, face = "bold"), 
+         axis.text.y = element_text(face = "bold", color = "black"), 
+         axis.ticks = element_line(size = 0.1, color = "black"), legend.position = c(0.9, 0.9), 
+         legend.justification = c("right", "top"), 
+         legend.background = element_blank(), 
+         legend.title = element_text(face = "bold"), 
+         legend.text = element_text(size = 10) )
+
+# -----------------------------
+# 14. Combine Map and Line Plot
+# -----------------------------
+combined_plot <- plot_grid(map_plot, line_plot, ncol = 2, rel_widths = c(3, 0.85), align = "h", axis = "tb")
+
+# -----------------------------
+# 15. Save Combined Plot
+# -----------------------------
+ggsave(filename = "Rainfall_maps_PK.jpeg",
+       plot = combined_plot, width = 16, height = 10, dpi = 300)
