@@ -1,0 +1,607 @@
+# ==========================================================
+# NEX-GDDP-CMIP6 GFDL-ESM4 Tmax (1980-2014) — Complete Workflow
+# ==========================================================
+# Steps:
+#  1. Download tasmax historical (1980-2014)
+#  2. Crop + mask to ROI shapefile
+#  3. Aggregate monthly means
+#  4. Compute climatology (baseline), anomalies
+#  5. Compute seasonal means + anomalies
+#  6. Mann–Kendall + Sen’s slope trends
+#  7. Create maps (monthly, seasonal anomaly, trend)
+#  8. Create time series plots (regional + seasonal)
+#  9. Save outputs (maps, CSVs, R objects)
+# ==========================================================
+
+# -----------------------------
+# Load Libraries
+# -----------------------------
+library(terra); library(sf); library(dplyr); library(tidyr); library(lubridate)
+library(data.table); library(ggplot2); library(RColorBrewer)
+library(ggspatial); library(patchwork); library(scales); library(cowplot)
+library(grid); library(broom); library(ncdf4); library(classInt); library(Kendall)
+library(trend); library(aws.s3); library(fst)
+# -----------------------------
+# 1. Define Years and Download URLs
+# -----------------------------
+
+
+# 1. Set the bucket and prefix
+bucket <- "nex-gddp-cmip6"
+prefix <- "NEX-GDDP-CMIP6/GFDL-ESM4/historical/r1i1p1f1/tasmax/"
+
+# 2. List all objects in that prefix
+files <- get_bucket_df(bucket = bucket, prefix = prefix, region = "us-west-2")
+
+# 3. Filter only files ending with "_v2.0.nc"
+v2_files <- subset(files, grepl("_v2\\.0\\.nc$", Key))
+
+# 4. Extract year from file name (YYYY before _v2.0.nc)
+v2_files$year <- as.numeric(sub(".*_(\\d{4})_v2\\.0\\.nc", "\\1", v2_files$Key))
+
+# 5. Filter for 2000–2014
+v2_files <- subset(v2_files, year >= 1960 & year <= 1979)
+
+# 6. Download filtered files
+for (f in v2_files$Key) {
+  message("Downloading: ", basename(f))
+  save_object(object = f,
+              bucket = bucket,
+              file = basename(f),
+              region = "us-west-2")
+}
+
+# -----------------------------
+# 4. List NetCDF Files in Folder
+# -----------------------------
+nc_files <- list.files( pattern = "\\.nc$", full.names = TRUE)
+
+# -----------------------------
+# 5. Read ROI Shapefile and Convert to SpatVector
+# -----------------------------
+# Replace "gadm41_PAK_0.shp" with your ROI shapefile path
+roi <- st_read("gadm41_PAK_1.shp", quiet = TRUE)
+roi_vect <- vect(roi)
+
+# -----------------------------
+# 6. Read, Crop, Mask, and Store Rasters + Dates (with progress updates)
+# -----------------------------
+rasters_list <- list()
+dates_list   <- list()
+
+total_files <- length(nc_files)
+
+for (i in seq_along(nc_files)) {
+  
+  message(sprintf("\n📂 Processing file %d of %d: %s", i, total_files, basename(nc_files[i])))
+  
+  r <- rast(nc_files[i])                       # Read NetCDF file
+  roi_vect_proj <- project(roi_vect, crs(r))   # Reproject ROI to match raster CRS
+  
+  t <- time(r)                                 # Extract time dimension
+  
+  r_cropped <- crop(r, roi_vect_proj)          # Crop to ROI extent
+  r_masked  <- mask(r_cropped, roi_vect_proj)  # Mask outside ROI
+  
+  rasters_list[[i]] <- r_masked
+  dates_list[[i]]   <- t
+  
+  message(sprintf("✅ Finished file %d of %d", i, total_files))
+}
+
+# -----------------------------
+# 7. Combine All Rasters into One Multi-layer Raster
+# -----------------------------
+message("\n📦 Merging all rasters into a single multi-layer stack...")
+r_stack <- rast(rasters_list)
+message("🎉 All rasters combined successfully!")
+
+
+# -----------------------------
+# 8. Generate Monthly Time Sequence
+# -----------------------------
+start_date <- as.Date("1960-01-01")
+end_date   <- as.Date("2014-12-31")
+time_vals <- time(r_stack)
+
+# If NULL, extract from NC
+if (is.null(time_vals)) {
+  nc <- nc_open(nc_files[1])
+  tvals <- ncvar_get(nc, "time")
+  t_units <- ncatt_get(nc, "time", "units")$value
+  nc_close(nc)
+  
+  parts <- strsplit(t_units, " since ")[[1]]
+  unit <- tolower(parts[1])
+  origin <- as.Date(parts[2])
+  
+  if (grepl("day", unit)) time_vals <- origin + tvals
+  else if (grepl("hour", unit)) time_vals <- as.Date(as.POSIXct(origin) + tvals*3600)
+  else time_vals <- origin + tvals
+}
+
+# Check
+length(time_vals)  # Should now match nlyr(r_stack)
+stopifnot(length(time_vals) == nlyr(r_stack))
+
+month_labels <- format(time_vals, "%Y-%m")
+group_idx <- as.integer(factor(format(time_vals, "%Y-%m"), levels = unique(month_labels)))
+# -----------------------------
+# 9. Aggregate Rasters into Monthly Mean
+# -----------------------------
+unique_months <- unique(month_labels)   # 2000-01, 2000-02, ..., 2014-12
+r_monthly <- tapp(r_stack, index = group_idx, fun = mean, na.rm = TRUE)
+names(r_monthly) <- unique_months
+
+# -----------------------------
+# 10. Convert Raster to Data Frame for ggplot
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "tasmax") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+roi_sf <- st_as_sf(roi)   # ROI polygon in sf
+
+# Convert dataframe to data.table
+dt <- as.data.table(r_df_long)
+dt_sf <- st_as_sf(dt, coords = c("x", "y"), crs = 4326, remove = FALSE)
+dt_joined <- st_join(dt_sf, roi_sf, left = TRUE)
+dt_joined <- as.data.table(dt_joined)
+# Convert factors to characters
+cols_factor <- names(dt_joined)[sapply(dt_joined, is.factor)]
+for (col in cols_factor) dt_joined[[col]] <- as.character(dt_joined[[col]])
+
+# Convert any POSIXct or Date columns to character (if exist)
+cols_date <- names(dt_joined)[sapply(dt_joined, inherits, "Date")]
+for (col in cols_date) dt_joined[[col]] <- as.character(dt_joined[[col]])
+dt_joined_clean <- copy(dt_joined)
+dt_joined_clean[, geometry := NULL]
+write_fst(dt_joined_clean, "NEX-GDDP-CMIP6 GFDL-ESM4 Tmax.fst", compress = 100)
+
+# Calculate monthly mean precipitation across years
+r_df_monthly <- r_df_long %>%
+  mutate(tasmax_C = tasmax - 273.15) %>%   # Convert K → °C
+  group_by(x, y, Month_Name) %>%
+  summarise(mean_tasmax = mean(tasmax_C, na.rm = TRUE), .groups = "drop")
+# -----------------------------
+# 11. Prepare Color Palettes for Mean Precipitation Map
+# ----------------------------
+vmin <- min(r_df_monthly$mean_tasmax, na.rm = TRUE)
+vmax <- max(r_df_monthly$mean_tasmax, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(r_df_monthly$mean_tasmax, n = 18, style = "equal")$brks
+colors <- c("#EE82EE", "#8A2BE2", "#00FFFF", "#00FF00", "#FFFF00", "#FF0000")
+
+# -----------------------------
+# 12. Map Plot (Facetted by Month)
+# -----------------------------
+map_plot <- ggplot(r_df_monthly, aes(x = x, y = y, fill = mean_tasmax)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Tmax (°C)", 
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = scales::label_number(accuracy = 1)) +
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Historical Monthly Mean Maximum Temperature (°C) \n(1960–2014) Pakistan",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: NEX-GDDP-CMIP6") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(2.2, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black"))
+
+
+# -----------------------------
+# 13. Line Plot of Monthly Mean by Year
+# -----------------------------
+setDT(r_df_long)
+r_df_long[, Month_Name := factor(Month_Name, levels = month.abb, ordered = TRUE)]
+
+monthly_mean <- r_df_long[, .(mean_tasmax = mean(tasmax - 273.15, na.rm = TRUE)),
+                          by = .(Year, Month_Name)]
+
+# Add a color variable: 2014 = black, others = grey
+monthly_mean[, color := ifelse(Year == 2014, "2014", "Other")]
+
+line_plot <- ggplot(monthly_mean, aes(x = Month_Name, y = mean_tasmax, group = Year)) +
+  geom_line(aes(color = color), size = 1) +
+  geom_point(aes(color = color), size = 1) +
+  scale_color_manual(values = c("2014" = "black", "Other" = "grey90")) +
+  labs(title = "(B) Monthly Mean Maximum Temperature \nby Year",
+       x = "Month", y = "Mean Maximum Temperature (°C)", color = "Year") +
+  theme_minimal() + 
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 10)
+  )
+
+
+
+
+#set theme for all graphs
+t1 = theme(
+  panel.spacing = unit(0, "pt"), 
+  panel.grid = element_blank(), 
+  panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+  plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+  axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+  axis.title = element_text(color = "black", size = 9, face = "bold"), 
+  axis.text.y = element_text(face = "bold", color = "black"), 
+  axis.ticks = element_line(size = 0.1, color = "black"), 
+  legend.justification = c("right", "top"), 
+  legend.background = element_blank(), 
+  legend.title = element_text(face = "bold"), 
+  legend.text = element_text(size = 10)
+)
+#set theme for all maps
+t2 = theme( panel.grid = element_blank(), 
+       panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+       strip.text = element_text(color = "black", face = "bold", size = 8), 
+       plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+       axis.text = element_text(color = "black", size = 9), 
+       axis.title = element_text(color = "black", size = 9, face = "bold"), 
+       panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+       legend.key.height = unit(2.2, "cm"), legend.key.width = unit(0.2, "cm"), 
+       legend.title = element_text(size = 8, face = "bold", color = "black"), 
+       legend.text = element_text(size = 10, color = "black") )
+
+#Calculate Temperature Indices
+setDT(r_df_long)
+
+# -----------------------------
+# 1. Convert Kelvin to Celsius
+# -----------------------------
+r_df_long[, tasmax_c := tasmax - 273.15]
+
+# -----------------------------
+# 2. Calculate Annual Mean Tmax
+# -----------------------------
+annual_mean <- r_df_long[, .(annual_tmax = mean(tasmax_c, na.rm = TRUE)), by = Year]
+
+# -----------------------------
+# 3. Calculate Baseline (1960-2010)
+# -----------------------------
+baseline <- annual_mean[Year %in% 1960:2010, mean(annual_tmax, na.rm = TRUE)]
+
+# -----------------------------
+# 4. Calculate Anomalies & Z-score
+# -----------------------------
+annual_mean[, `:=`(
+  anomaly = annual_tmax - baseline,
+  z_score = (annual_tmax - mean(annual_tmax)) / sd(annual_tmax)
+)]
+
+# -----------------------------
+# 5. Calculate Cumulative Tmax (per year)
+# -----------------------------
+cumulative_tmax <- r_df_long[, .(cumulative_tmax = cumsum(tasmax_c)), by = Year]
+
+#Create a Map of Mean Tmax (1960–2014)
+# Compute mean Tmax per grid cell
+grid_mean <- r_df_long[, .(mean_tasmax = mean(tasmax_c, na.rm = TRUE)), by = .(x, y)]
+
+# Convert to SpatRaster
+r_mean <- rast(grid_mean, type = "xyz", crs = "EPSG:4326")
+
+# Plot Map
+ ggplot(as.data.frame(r_mean, xy = TRUE)) +
+  geom_raster(aes(x = x, y = y, fill = mean_tasmax)) +
+   geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_viridis_c(name = "Mean Tmax (°C)") +
+  coord_sf() +
+  labs(title = "Mean Tmax (1960–2014)") +
+  theme_minimal()+
+   t2
+
+ #Plot Yearly Tmax (with Anomalies) 
+anamoly_plot =  ggplot(annual_mean, aes(x = as.numeric(Year), y = annual_tmax)) +
+   geom_line(color = "grey70", linewidth = 1.2) +
+   geom_point(color = "grey70", size = 2) +
+   geom_line(data = annual_mean[Year == 2014], aes(x = as.numeric(Year), y = annual_tmax),
+             color = "black", linewidth = 1.4) +
+   geom_point(data = annual_mean[Year == 2014], aes(x = as.numeric(Year), y = annual_tmax),
+              color = "black", size = 3) +
+   geom_hline(yintercept = baseline, linetype = "dashed", color = "red",, size = 1) +
+   scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                      limits = c(1960, 2014)) +           # Optional: force axis limits
+   labs(title = "(C) Annual Mean Tmax with Baseline\n (1960–2014)",
+        x = "Year", y = "Annual Mean Tmax (°C)") +
+   theme_minimal()+
+   t1
+ 
+ # Add Season column
+ r_df_long[, Season := fifelse(Month %in% c("12", "01", "02"), "DJF",
+                               fifelse(Month %in% c("03", "04", "05"), "MAM",
+                                       fifelse(Month %in% c("06", "07", "08"), "JJA", "SON")))]
+ 
+ # Convert to factor (ordered)
+ r_df_long[, Season := factor(Season, levels = c("DJF","MAM","JJA","SON"))] 
+ 
+ #Compute Seasonal Means (Baseline + Each Year)
+ # Seasonal mean per grid cell & year
+ seasonal_means <- r_df_long[, .(mean_tasmax = mean(tasmax - 273.15, na.rm = TRUE)),
+                             by = .(x, y, Year, Season)]
+ 
+ # Baseline (1960–2010)
+ baseline_seasonal <- seasonal_means[Year %in% 1960:2010,
+                                     .(baseline_tmax = mean(mean_tasmax, na.rm = TRUE)),
+                                     by = .(x, y, Season)]
+ 
+ # Merge to calculate anomaly
+ seasonal_anomaly <- merge(seasonal_means, baseline_seasonal,
+                           by = c("x","y","Season"), all.x = TRUE)
+ 
+ seasonal_anomaly[, anomaly := mean_tasmax - baseline_tmax] 
+ 
+#Plot Seasonal Mean Anomaly Map for 2014
+ plot_list <- list()
+ for (s in levels(seasonal_anomaly$Season)) {
+   df_season <- seasonal_anomaly[Year == 2014 & Season == s]
+   
+   p <- ggplot(df_season, aes(x = x, y = y, fill = anomaly)) +
+     geom_raster() +
+     geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+     scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                          midpoint = 0, name = "Anomaly (°C)") +
+     coord_sf() +
+     labs(title = paste("Tmax Anomaly (2014) –", s)) +
+     theme_minimal() +
+     t2
+   
+   plot_list[[s]] <- p
+ }
+ 
+ # Combine all 4 seasons in one figure
+ seasonal_anomaly_plot <- (plot_list$DJF | plot_list$MAM) /
+   (plot_list$JJA | plot_list$SON)
+
+ #Seasonal Time Series Plot
+ seasonal_trend <- seasonal_anomaly[, .(mean_anomaly = mean(anomaly, na.rm = TRUE)),
+                                    by = .(Year, Season)]
+ 
+ seasonal_trend_plot <- ggplot(seasonal_trend,
+                               aes(x = Year, y = mean_anomaly, color = Season, group = Season)) +
+   geom_line(linewidth = 1.2) +
+   geom_point(size = 2) +
+   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+   labs(title = "Seasonal Tmax Anomalies (1960–2014)",
+        x = "Year", y = "Anomaly (°C)") +
+   theme_minimal() +
+   t1
+ 
+#Seasonal Trend Significance (Mann–Kendall Test)
+# Mann–Kendall trend per grid cell and season
+ mk_results <- seasonal_anomaly[, {
+   if (length(unique(Year)) > 5) {
+     mk <- MannKendall(anomaly)
+     list(tau = mk$tau, p.value = mk$sl)
+   } else list(tau = NA, p.value = NA)
+ }, by = .(x, y, Season)]
+ 
+ # Merge results back
+ seasonal_significance <- merge(seasonal_anomaly, mk_results,
+                                by = c("x","y","Season"), all.x = TRUE)
+ 
+ # Add significance flag
+ seasonal_significance[, sig := fifelse(p.value <= 0.05, "Significant", "NS")]
+
+#Seasonal Mean + Significance Mask for 2014
+ df_2014 <- seasonal_significance[Year == 2014]
+ 
+ plot_list <- list()
+ for (s in levels(df_2014$Season)) {
+   df_s <- df_2014[Season == s]
+   
+   p <- ggplot(df_s, aes(x = x, y = y, fill = anomaly)) +
+     geom_raster() +
+     geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+     scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                          midpoint = 0, name = "Anomaly (°C)") +
+     geom_point(data = df_s[sig == "Significant"],
+                aes(x = x, y = y), inherit.aes = FALSE,
+                shape = 4, size = 1, color = "black", stroke = 0.3) +
+     coord_sf() +
+     labs(title = paste("Tmax Anomaly (2014) –", s),
+          subtitle = "Black cross = statistically significant trend (p ≤ 0.05)") +
+     theme_minimal() +
+     t2
+   
+   plot_list[[s]] <- p
+ }
+
+ seasonal_sig_map <- (plot_list$DJF | plot_list$MAM) /
+   (plot_list$JJA | plot_list$SON) 
+
+#Summary Table (Optional)
+ sig_summary <- mk_results[, .(
+   Significant_Gridcells = sum(p.value <= 0.05, na.rm = TRUE),
+   Total_Gridcells = .N,
+   Percent_Significant = round(100 * sum(p.value <= 0.05, na.rm = TRUE)/.N, 1)
+ ), by = Season]
+ 
+ print(sig_summary) 
+ 
+#Sen’s Slope Calculation (°C/decade)
+# Sen's slope per grid cell and season
+ sens_results <- seasonal_anomaly[, {
+   if (length(unique(Year)) > 5) {
+     fit <- sens.slope(anomaly)
+     list(slope = fit$estimates, p.value = fit$p.value)
+   } else list(slope = NA, p.value = NA)
+ }, by = .(x, y, Season)]
+ 
+ # Convert slope from °C/year → °C/decade
+ sens_results[, slope_decade := slope * 10]
+ 
+ # Merge results back
+ seasonal_trends <- merge(seasonal_anomaly, sens_results,
+                          by = c("x","y","Season"), all.x = TRUE)
+ 
+ seasonal_trends[, sig := fifelse(p.value <= 0.05, "Significant", "NS")] 
+ 
+#Map Sen’s Slope for Each Season
+ smin <- min(seasonal_trends$slope_decade, na.rm = TRUE)
+ smax <- max(seasonal_trends$slope_decade, na.rm = TRUE)
+ 
+ sbreaks <- classInt::classIntervals(seasonal_trends$slope_decade, n = 5, style = "equal")$brks
+ 
+ trend_plot <- ggplot(seasonal_trends, aes(x = x, y = y, fill = slope_decade)) +
+   geom_raster() +
+   geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+   scale_fill_gradientn(
+     colours = colors,
+     limits = c(smin, smax),
+     breaks = sbreaks,
+     labels = label_number(accuracy = 0.01),
+     name = "Trend \n(°C/decade)"
+   ) +
+   geom_point(
+     data = seasonal_trends[sig == "Significant"],
+     aes(x = x, y = y),
+     inherit.aes = FALSE,
+     shape = 4, size = 1, color = "black", stroke = 0.3
+   ) +
+   coord_sf() +
+   facet_wrap(~Season, ncol = 2) +  # <-- automatic faceting into 4 panels
+   labs(
+     title = "Sen's Slope – Seasonal Trends",
+     subtitle = "Black cross = significant trend (p ≤ 0.05)",
+     x = "Longitude",             # ✅ added
+     y = "Latitude"               # ✅ added
+   ) +
+   theme_minimal() +
+   theme(
+     legend.position = "right",         # single legend right side
+     strip.text = element_text(face = "bold"), # bold facet labels
+     plot.title = element_text(face = "bold", size = 14)
+   ) +
+   t2
+#Summary Table of Trends
+trend_summary <- sens_results[, .(
+  Median_Slope = median(slope_decade, na.rm = TRUE),
+  Percent_Warming = round(100 * mean(slope_decade > 0, na.rm = TRUE), 1),
+  Percent_Significant = round(100 * mean(p.value <= 0.05, na.rm = TRUE), 1)
+), by = Season]
+
+print(trend_summary)
+
+#Compute Regional Mean & Sen’s Slope
+# Regional mean seasonal anomaly (area-weighted mean could also be used)
+regional_mean <- seasonal_anomaly[, .(mean_anomaly = mean(anomaly, na.rm = TRUE)),
+                                  by = .(Year, Season)]
+
+# Compute Sen’s slope for each season (°C/decade)
+regional_trends <- regional_mean[, {
+  fit <- sens.slope(mean_anomaly)
+  list(slope = fit$estimates, p.value = fit$p.value)
+}, by = Season]
+
+regional_trends[, slope_decade := slope * 10]
+print(regional_trends)
+
+# Regional mean seasonal anomaly
+regional_mean <- seasonal_anomaly[, .(mean_anomaly = mean(anomaly, na.rm = TRUE)),
+                                  by = .(Year, Season)]
+
+# Plot with trend lines per season
+time_series_plot <- ggplot(regional_mean, aes(x = Year, y = mean_anomaly)) +
+  geom_point(aes(color = Season), alpha = 0.6, size = 2) +
+  geom_smooth(aes(group = Season, color = Season, fill = Season),
+              method = "lm", se = TRUE, size = 1) +  # Trend line per season
+  facet_wrap(~Season, scales = "free_y") +
+  labs(title = "Regional Seasonal Tmax Anomalies (1960–2014)",
+       subtitle = "Lines show Sen's slope (°C/decade)",
+       x = "Year", y = "Mean Anomaly (°C)") +
+  theme_minimal() +
+  t1
+
+time_series_plot
+
+# 1. Regional mean seasonal anomaly
+regional_mean <- seasonal_anomaly[, .(mean_anomaly = mean(anomaly, na.rm = TRUE)),
+                                  by = .(Year, Season)]
+regional_mean[, Year := as.numeric(as.character(Year))]
+
+# 2. Calculate R² and correlation for each season
+model_stats <- regional_mean[, {
+  mod <- lm(mean_anomaly ~ Year)
+  r2 <- summary(mod)$r.squared
+  corr <- cor(Year, mean_anomaly, use = "complete.obs")
+  list(R2 = r2, Correlation = corr)
+}, by = Season]
+
+# 3. Prepare text labels for annotation
+model_stats[, label := paste0("R² = ", round(R2, 2), 
+                              "\n r = ", round(Correlation, 2))]
+
+# 4. Merge back with regional_mean to get min/max for positioning text
+stats_with_y <- merge(model_stats, regional_mean[, .(Season, ymin = min(mean_anomaly), ymax = max(mean_anomaly))], 
+                      by = "Season", all.x = TRUE)
+
+# Text position: slightly above ymax
+stats_with_y[, ypos := ymax + 0.1 * (ymax - ymin)]
+stats_with_y[, xpos := max(regional_mean$Year)]  # Place at right side
+
+# 5. Plot with trend lines per season + annotation
+time_series_plot <- ggplot(regional_mean, aes(x = Year, y = mean_anomaly)) +
+  geom_point(aes(color = Season), alpha = 0.6, size = 2) +
+  geom_smooth(aes(group = Season, color = Season, fill = Season),
+              method = "lm", se = TRUE, size = 1) +
+  geom_text(data = stats_with_y, aes(x = xpos, y = ypos, label = label),
+            inherit.aes = FALSE, hjust = 1, vjust = 1, size = 3.5, fontface = "bold") +
+  facet_wrap(~Season, scales = "free_y") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(
+    title = "Regional Seasonal Tmax Anomalies (1960–2014)",
+    subtitle = "Lines show Sen's slope (°C/decade) with R² and r",
+    x = "Year", y = "Mean Anomaly (°C)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = c(0.05, 0.95))+
+  t1
+
+
+# -----------------------------
+# Combine Map and Line Plot
+# -----------------------------
+combined_plot <- plot_grid(map_plot, line_plot/ anamoly_plot, ncol = 2, rel_widths = c(3, 0.85), align = "h", axis = "tb")
+
+# -----------------------------
+# Save Combined Plot
+# -----------------------------
+ggsave(filename = "NEX-GDDP-CMIP6 GFDL-ESM4 Tmax.jpeg",
+       plot = combined_plot, width = 16, height = 10, dpi = 300)
+
+
