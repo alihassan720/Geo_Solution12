@@ -1,0 +1,479 @@
+##############################################################
+# NEX-GDDP-CMIP6 Tmin Workflow – Complete & Well-Commented
+# Author: Ali Hassan Shabbir
+# Video Intro (use this in your second video):
+#
+# "Hi everyone, this is Ali.
+# In today’s video, I’ll walk you through a complete workflow
+# for working with NEX-GDDP-CMIP6 GFDL-ESM4 minimum temperature data —
+# from downloading NetCDF files from S3, cropping and masking to a region
+# of interest, calculating monthly means, and then performing trend
+# analysis using Sen’s slope and the Mann–Kendall test. Finally,
+# we’ll visualize the results in beautiful maps and plots.
+# Let’s get started."
+#
+##############################################################
+
+#############################
+# 1. Load Required Libraries #
+#############################
+# -----------------------------
+library(terra); library(sf); library(dplyr); library(tidyr); library(lubridate)
+library(data.table); library(ggplot2); library(RColorBrewer)
+library(ggspatial); library(patchwork); library(scales); library(cowplot)
+library(grid); library(broom); library(ncdf4); library(classInt); library(Kendall)
+library(trend); library(aws.s3); library(fst)
+# -----------------------------
+# 1. Define Years and Download URLs
+# -----------------------------
+
+
+# 1. Set the bucket and prefix
+bucket <- "nex-gddp-cmip6"
+prefix <- "NEX-GDDP-CMIP6/GFDL-ESM4/historical/r1i1p1f1/tasmin/"
+
+# 2. List all objects in that prefix
+files <- get_bucket_df(bucket = bucket, prefix = prefix, region = "us-west-2")
+
+# 3. Filter only files ending with "_v2.0.nc"
+v2_files <- subset(files, grepl("_v2\\.0\\.nc$", Key))
+
+# 4. Extract year from file name (YYYY before _v2.0.nc)
+v2_files$year <- as.numeric(sub(".*_(\\d{4})_v2\\.0\\.nc", "\\1", v2_files$Key))
+
+# 5. Filter for 1960–2014
+v2_files <- subset(v2_files, year >= 1960 & year <= 2014)
+
+# 6. Download filtered files
+for (f in v2_files$Key) {
+  message("Downloading: ", basename(f))
+  save_object(object = f,
+              bucket = bucket,
+              file = basename(f),
+              region = "us-west-2")
+}
+
+# -----------------------------
+# 4. List NetCDF Files in Folder
+# -----------------------------
+nc_files <- list.files( pattern = "\\.nc$", full.names = TRUE)
+
+# -----------------------------
+# 5. Read ROI Shapefile and Convert to SpatVector
+# -----------------------------
+# Replace "gadm41_PAK_0.shp" with your ROI shapefile path
+roi <- st_read("gadm41_PAK_1.shp", quiet = TRUE)
+roi_vect <- vect(roi)
+
+# -----------------------------
+# 6. Read, Crop, Mask, and Store Rasters + Dates (with progress updates)
+# -----------------------------
+rasters_list <- list()
+dates_list   <- list()
+
+total_files <- length(nc_files)
+
+for (i in seq_along(nc_files)) {
+  
+  message(sprintf("\n📂 Processing file %d of %d: %s", i, total_files, basename(nc_files[i])))
+  
+  r <- rast(nc_files[i])                       # Read NetCDF file
+  roi_vect_proj <- project(roi_vect, crs(r))   # Reproject ROI to match raster CRS
+  
+  t <- time(r)                                 # Extract time dimension
+  
+  r_cropped <- crop(r, roi_vect_proj)          # Crop to ROI extent
+  r_masked  <- mask(r_cropped, roi_vect_proj)  # Mask outside ROI
+  
+  rasters_list[[i]] <- r_masked
+  dates_list[[i]]   <- t
+  
+  message(sprintf("✅ Finished file %d of %d", i, total_files))
+}
+
+# -----------------------------
+# 7. Combine All Rasters into One Multi-layer Raster
+# -----------------------------
+message("\n📦 Merging all rasters into a single multi-layer stack...")
+r_stack <- rast(rasters_list)
+message("🎉 All rasters combined successfully!")
+
+
+# -----------------------------
+# 8. Generate Monthly Time Sequence
+# -----------------------------
+start_date <- as.Date("1960-01-01")
+end_date   <- as.Date("2014-12-31")
+time_vals <- time(r_stack)
+
+# If NULL, extract from NC
+if (is.null(time_vals)) {
+  nc <- nc_open(nc_files[1])
+  tvals <- ncvar_get(nc, "time")
+  t_units <- ncatt_get(nc, "time", "units")$value
+  nc_close(nc)
+  
+  parts <- strsplit(t_units, " since ")[[1]]
+  unit <- tolower(parts[1])
+  origin <- as.Date(parts[2])
+  
+  if (grepl("day", unit)) time_vals <- origin + tvals
+  else if (grepl("hour", unit)) time_vals <- as.Date(as.POSIXct(origin) + tvals*3600)
+  else time_vals <- origin + tvals
+}
+
+# Check
+length(time_vals)  # Should now match nlyr(r_stack)
+stopifnot(length(time_vals) == nlyr(r_stack))
+
+month_labels <- format(time_vals, "%Y-%m")
+group_idx <- as.integer(factor(format(time_vals, "%Y-%m"), levels = unique(month_labels)))
+# -----------------------------
+# 9. Aggregate Rasters into Monthly Mean
+# -----------------------------
+unique_months <- unique(month_labels)   # 2000-01, 2000-02, ..., 2014-12
+r_monthly <- tapp(r_stack, index = group_idx, fun = mean, na.rm = TRUE)
+names(r_monthly) <- unique_months
+
+# -----------------------------
+# 10. Convert Raster to Data Frame for ggplot
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+r_df_long <- r_df %>%
+  pivot_longer(cols = -c(x, y), names_to = "year_month", values_to = "tasmin") %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year)
+  )
+roi_sf <- st_as_sf(roi)   # ROI polygon in sf
+
+# Convert dataframe to data.table
+dt <- as.data.table(r_df_long)
+dt_sf <- st_as_sf(dt, coords = c("x", "y"), crs = 4326, remove = FALSE)
+dt_joined <- st_join(dt_sf, roi_sf, left = TRUE)
+dt_joined <- as.data.table(dt_joined)
+# Convert factors to characters
+cols_factor <- names(dt_joined)[sapply(dt_joined, is.factor)]
+for (col in cols_factor) dt_joined[[col]] <- as.character(dt_joined[[col]])
+
+# Convert any POSIXct or Date columns to character (if exist)
+cols_date <- names(dt_joined)[sapply(dt_joined, inherits, "Date")]
+for (col in cols_date) dt_joined[[col]] <- as.character(dt_joined[[col]])
+dt_joined_clean <- copy(dt_joined)
+dt_joined_clean[, geometry := NULL]
+write_fst(dt_joined_clean, "NEX-GDDP-CMIP6 GFDL-ESM4 Tmin.fst", compress = 100)
+
+# Calculate monthly mean Tmin across years
+r_df_monthly <- r_df_long %>%
+  mutate(tasmin = tasmin - 273.15) %>%   # Convert K → °C
+  group_by(x, y, Month_Name) %>%
+  summarise(mean_tasmin = mean(tasmin, na.rm = TRUE), .groups = "drop")
+# -----------------------------
+# 11. Prepare Color Palettes for Mean Precipitation Map
+# ----------------------------
+vmin <- min(r_df_monthly$mean_tasmin, na.rm = TRUE)
+vmax <- max(r_df_monthly$mean_tasmin, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(r_df_monthly$mean_tasmin, n = 18, style = "equal")$brks
+
+colors <- c(
+  "#0164ff",  # cyan
+  "#7f96fe",  # green
+  "#96fe07",  # yellow
+  "#feff03",
+  "#ff9f00",
+  "#fd1a00"
+)
+# -----------------------------
+# 12. Map Plot (Facetted by Month)
+# -----------------------------
+p <- ggplot(r_df_monthly, aes(x = x, y = y, fill = mean_tasmin)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Tmax (°C)",
+    colours = colors,       # gradient will interpolate between these
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 6),
+    labels = scales::label_number(accuracy = 1)
+  )   +
+  coord_sf()+
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Historical Monthly Mean Minimum Temperature (°C) \n(1960–2014) Pakistan",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: NEX-GDDP-CMIP6") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(1.9, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black"))
+
+
+# -----------------------------
+# 13. Line Plot of Monthly Mean by Year
+# -----------------------------
+setDT(r_df_long)
+r_df_long[, Month_Name := factor(Month_Name, levels = month.abb, ordered = TRUE)]
+
+monthly_mean <- r_df_long[, .(mean_tasmin = mean(tasmin - 273.15, na.rm = TRUE)),
+                          by = .(Year, Month_Name)]
+
+# Add a color variable: 2014 = black, others = grey
+monthly_mean[, color := ifelse(Year == 2014, "2014", "Other")]
+
+line_plot <- ggplot(monthly_mean, aes(x = Month_Name, y = mean_tasmin, group = Year)) +
+  geom_line(aes(color = color), size = 1) +
+  geom_point(aes(color = color), size = 1) +
+  scale_color_manual(values = c("2014" = "black", "Other" = "grey90")) +
+  labs(title = "(B) Monthly Mean Maximum Temperature \nby Year",
+       x = "Month", y = "Mean Maximum Temperature (°C)", color = "Year") +
+  theme_minimal() + 
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 10)
+  )
+
+
+
+
+#set theme for all graphs
+t1 = theme(
+  panel.spacing = unit(0, "pt"), 
+  panel.grid = element_blank(), 
+  panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+  plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+  axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+  axis.title = element_text(color = "black", size = 9, face = "bold"), 
+  axis.text.y = element_text(face = "bold", color = "black"), 
+  axis.ticks = element_line(size = 0.1, color = "black"), 
+  legend.justification = c("right", "top"), 
+  legend.background = element_blank(), 
+  legend.title = element_text(face = "bold"), 
+  legend.text = element_text(size = 10)
+)
+#set theme for all maps
+t2 = theme( panel.grid = element_blank(), 
+            panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+            strip.text = element_text(color = "black", face = "bold", size = 8), 
+            plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+            axis.text = element_text(color = "black", size = 9), 
+            axis.title = element_text(color = "black", size = 9, face = "bold"), 
+            panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+            legend.key.height = unit(2.0, "cm"), legend.key.width = unit(0.2, "cm"), 
+            legend.title = element_text(size = 8, face = "bold", color = "black"), 
+            legend.text = element_text(size = 10, color = "black") )
+
+sen_slope <- function(y, t = NULL) {
+  # y: numeric vector (time series), t: time vector (optional; default 1:length(y))
+  if (is.null(t)) t <- seq_along(y)
+  ok <- which(!is.na(y) & !is.na(t))
+  if (length(ok) < 2) return(NA_real_)
+  yok <- y[ok]; tok <- t[ok]
+  n <- length(yok)
+  # compute all pairwise slopes (yj - yi)/(tj - ti) for j>i
+  # for efficiency with short series it's fine; if series are very long consider optimized approach
+  slopes <- numeric( (n*(n-1))/2 )
+  idx <- 1L
+  for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
+      slopes[idx] <- (yok[j] - yok[i]) / (tok[j] - tok[i])
+      idx <- idx + 1L
+    }
+  }
+  median(slopes, na.rm = TRUE)
+}
+
+# -----------------------------
+# Compute per-cell Sen slope and Mann-Kendall p-value for TN90p
+# -----------------------------
+# 'indices' should contain: x, y, Year, TN90p
+# Convert to data.table (fresh)
+r_df_long <- as.data.table(r_df_long)
+
+# Convert to °C
+r_df_long[, tasmin := tasmin - 273.15]
+
+# Compute percentiles by grid cell
+percentiles <- r_df_long[, .(
+  p10 = quantile(tasmin, 0.10, na.rm = TRUE),
+  p90 = quantile(tasmin, 0.90, na.rm = TRUE)
+), by = .(x, y)]
+# Merge these percentiles back into r_df_long
+r_df_long <- merge(
+  r_df_long,
+  percentiles,
+  by = c("x", "y"),
+  all.x = TRUE
+)
+
+# Merge with r_df_long (overwrite if already merged)
+r_df_long <- r_df_long[, .(
+  x, y, year_month, tasmin, Year, Month, Month_Name, Year_Month_Label, p10, p90
+)]
+
+indices <- r_df_long[, .(
+  TNx   = max(tasmin, na.rm = TRUE),                
+  TNn   = min(tasmin, na.rm = TRUE),                
+  TR20  = sum(tasmin > 20, na.rm = TRUE),           
+  FD    = sum(tasmin < 0, na.rm = TRUE),            
+  TN90p = sum(tasmin > p90, na.rm = TRUE) / .N * 100,  
+  TN10p = sum(tasmin < p10, na.rm = TRUE) / .N * 100   
+), by = .(x, y, Year)]
+
+
+
+# Ensure Year numeric and sorted
+indices[, Year := as.integer(Year)]
+setorder(indices, x, y, Year)
+setDT(indices)
+
+# We'll compute: sen_slope_per_year (units: percent-points per year), mk_pvalue
+trend_cell_list <- indices[, {
+  series <- TN90p
+  years <- Year
+  s <- tryCatch(sen_slope(series, years), error = function(e) NA_real_)
+  # Mann-Kendall test for monotonic trend (require at least 3 non-NA)
+  mk_p <- NA_real_
+  if (sum(!is.na(series)) >= 3) {
+    mk <- tryCatch(Kendall::MannKendall(series), error = function(e) NULL)
+    if (!is.null(mk)) mk_p <- as.numeric(mk$sl)  # 'sl' element is p-value
+  }
+  .(sen = s, mk_p = mk_p)
+}, by = .(x, y)]
+
+# Merge back into spatial-style table for mapping
+# choose a representative Year for faceting or simply keep coordinates and the two trend cols
+trend_cell_list[, sig := factor(ifelse(is.na(mk_p), NA,
+                                       ifelse(mk_p < 0.01, "***",
+                                              ifelse(mk_p < 0.05, "**",
+                                                     ifelse(mk_p < 0.1, "*", "ns")))),
+                                levels = c("***", "**", "*", "ns"))]
+
+# -----------------------------
+# Create maps for Sen's slope and significance
+# -----------------------------
+# Make polygons/raster plotting like before (geom_raster expects regular grid)
+# If your x,y are on a regular grid, geom_raster will work. Otherwise consider converting to sf polygons.
+
+# Palette for slope (diverging around 0)
+slope_colors <- c("#2c7bb6", "#abd9e9", "#f7f7f7", "#fdae61", "#d7191c")  # blue -> white -> red
+
+vmin_sen <- min(trend_cell_list$sen, na.rm = TRUE)
+vmax_sen <- max(trend_cell_list$sen, na.rm = TRUE)
+breaks_sen <- classInt::classIntervals(trend_cell_list$sen, n = 5, style = "pretty")$brks
+
+map_sen <- ggplot(trend_cell_list, aes(x = x, y = y, fill = sen)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  coord_sf()+
+  scale_fill_gradientn(colours = slope_colors, limits = c(vmin_sen, vmax_sen),
+                       breaks = breaks_sen, name = "Sen slope\n(%-points / year)",
+                       guide = guide_colorbar(
+                         barheight = unit(5, "cm"),
+                         barwidth  = unit(0.18, "cm")
+                       )) +
+  labs(title = "(B) Sen's slope for TN90p \n(percent-points per year)",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  t2
+
+# Map for significance (plot stars)
+# create a column for plotting stars where significant
+trend_cell_list[, star := as.character(sig)]
+trend_cell_list[is.na(star), star := ""]
+
+map_sig <- ggplot(trend_cell_list, aes(x = x, y = y)) +
+  geom_raster(aes(fill = as.numeric(mk_p)), alpha = 0.6) +   # background: p-value shading
+  geom_text(aes(label = star), size = 2, color = "black", na.rm = TRUE) +  # stars
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  coord_sf()+
+  scale_fill_viridis_c(option = "turbo", na.value = "grey90", name = "Mann-Kendall p",
+                       guide = guide_colorbar(
+                         barheight = unit(6, "cm"),
+                         barwidth  = unit(0.18, "cm")
+                       )) +
+  labs(title = "Trend significance (Mann–Kendall p-value) and significance stars",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4))+
+  t2
+
+# -----------------------------
+# Compute global mean TN90p time series and global Sen + MK
+# -----------------------------
+tn90p_global <- indices[, .(global_mean = mean(TN90p, na.rm = TRUE)), by = Year]
+setorder(tn90p_global, Year)
+
+global_sen <- sen_slope(tn90p_global$global_mean, tn90p_global$Year)
+global_mk <- if (nrow(tn90p_global) >= 3) {
+  mkg <- Kendall::MannKendall(tn90p_global$global_mean)
+  mkg$sl
+} else NA_real_
+
+# Trend plot annotated
+min_val <- tn90p_global[which.min(tn90p_global$global_mean), ]
+max_val <- tn90p_global[which.max(tn90p_global$global_mean), ]
+
+trend_TN90p_annotated <- ggplot(tn90p_global, aes(x = Year, y = global_mean)) +
+  geom_line(color = "darkred", linewidth = 1) +
+  geom_point(size = 1) +
+  geom_text(data = min_val, aes(label = round(global_mean,1)), 
+            vjust = 1.5, color = "blue", size = 3) +   # min value label
+  geom_text(data = max_val, aes(label = round(global_mean,1)), 
+            vjust = -0.5, color = "darkgreen", size = 3) + # max value label
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),
+                     limits = c(1960, 2014)) +
+  labs(title = "(C) Domain mean TN90p through time",
+       subtitle = paste0("Sen's slope = ", round(global_sen, 3),
+                         " %-points/yr; \nMann-Kendall p = ", 
+                         ifelse(is.na(global_mk), "NA", sprintf("%.3f", global_mk))),
+       x = "Year", y = "TN90p (% nights)") +
+  theme_minimal() +
+  t1
+line_plot_fixed <- trend_TN90p_annotated + theme(aspect.ratio =1)
+
+
+combined_plot <- plot_grid(
+  p, map_sen/line_plot_fixed,
+  ncol = 2, rel_widths = c(1, .49),
+  align = "h", axis = "tblr"
+)
+
+ggsave(
+  filename = "NEX-GDDP-CMIP6 GFDL-ESM4 Tmax.jpeg",
+  plot = combined_plot,
+  width = 15, height = 8, dpi = 300
+)
+
+
