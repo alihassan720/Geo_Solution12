@@ -1,0 +1,508 @@
+##############################################################
+# NEX-GDDP-CMIP6 Tmin Workflow – Complete & Well-Commented
+# Author: Ali Hassan Shabbir
+# Video Intro (use this in your second video):
+#
+# "Hi everyone, this is Ali.
+# In today’s video, I’ll walk you through a complete workflow
+# for working with NEX-GDDP-CMIP6 GFDL-ESM4 precipitation data —
+# from downloading NetCDF files from S3, cropping and masking to a region
+# of interest, calculating monthly means. Finally,
+# we’ll visualize the results in beautiful maps and plots.
+# Let’s get started."
+#
+##############################################################
+
+#############################
+# 1. Load Required Libraries #
+#############################
+# -----------------------------
+library(terra); library(sf); library(dplyr); library(tidyr); library(lubridate)
+library(data.table); library(ggplot2); library(RColorBrewer)
+library(ggspatial); library(patchwork); library(scales); library(cowplot)
+library(grid); library(broom); library(ncdf4); library(classInt); library(Kendall)
+library(trend); library(aws.s3); library(fst); library(purrr)
+# -----------------------------
+# 1. Define Years and Download URLs
+# -----------------------------
+
+
+# 1. Set the bucket and prefix
+bucket <- "nex-gddp-cmip6"
+prefix <- "NEX-GDDP-CMIP6/GFDL-ESM4/historical/r1i1p1f1/pr/"
+
+# 2. List all objects in that prefix
+files <- get_bucket_df(bucket = bucket, prefix = prefix, region = "us-west-2")
+
+# 3. Filter only files ending with "_v2.0.nc"
+v2_files <- subset(files, grepl("_v2\\.0\\.nc$", Key))
+
+# 4. Extract year from file name (YYYY before _v2.0.nc)
+v2_files$year <- as.numeric(sub(".*_(\\d{4})_v2\\.0\\.nc", "\\1", v2_files$Key))
+
+# 5. Filter for 1960–2014
+v2_files <- subset(v2_files, year >= 1960 & year <= 2014)
+
+# 6. Download filtered files
+for (f in v2_files$Key) {
+  message("Downloading: ", basename(f))
+  save_object(object = f,
+              bucket = bucket,
+              file = basename(f),
+              region = "us-west-2")
+}
+
+# -----------------------------
+# 4. List NetCDF Files in Folder
+# -----------------------------
+nc_files <- list.files( pattern = "\\.nc$", full.names = TRUE)
+
+# -----------------------------
+# 5. Read ROI Shapefile and Convert to SpatVector
+# -----------------------------
+# Replace "gadm41_PAK_0.shp" with your ROI shapefile path
+roi <- st_read("gadm41_PAK_1.shp", quiet = TRUE)
+roi_vect <- vect(roi)
+
+# -----------------------------
+# 6. Read, Crop, Mask, and Store Rasters + Dates (with progress updates)
+# -----------------------------
+rasters_list <- list()
+dates_list   <- list()
+
+total_files <- length(nc_files)
+
+for (i in seq_along(nc_files)) {
+  
+  message(sprintf("\n📂 Processing file %d of %d: %s", i, total_files, basename(nc_files[i])))
+  
+  r <- rast(nc_files[i])                       # Read NetCDF file
+  roi_vect_proj <- project(roi_vect, crs(r))   # Reproject ROI to match raster CRS
+  
+  t <- time(r)                                 # Extract time dimension
+  
+  r_cropped <- crop(r, roi_vect_proj)          # Crop to ROI extent
+  r_masked  <- mask(r_cropped, roi_vect_proj)  # Mask outside ROI
+  
+  rasters_list[[i]] <- r_masked
+  dates_list[[i]]   <- t
+  
+  message(sprintf("✅ Finished file %d of %d", i, total_files))
+}
+
+# -----------------------------
+# 7. Combine All Rasters into One Multi-layer Raster
+# -----------------------------
+message("\n📦 Merging all rasters into a single multi-layer stack...")
+r_stack <- rast(rasters_list)
+message("🎉 All rasters combined successfully!")
+
+
+# -----------------------------
+# 8. Generate Monthly Time Sequence
+# -----------------------------
+start_date <- as.Date("1960-01-01")
+end_date   <- as.Date("2014-12-31")
+time_vals <- time(r_stack)
+
+# If NULL, extract from NC
+if (is.null(time_vals)) {
+  nc <- nc_open(nc_files[1])
+  tvals <- ncvar_get(nc, "time")
+  t_units <- ncatt_get(nc, "time", "units")$value
+  nc_close(nc)
+  
+  parts <- strsplit(t_units, " since ")[[1]]
+  unit <- tolower(parts[1])
+  origin <- as.Date(parts[2])
+  
+  if (grepl("day", unit)) time_vals <- origin + tvals
+  else if (grepl("hour", unit)) time_vals <- as.Date(as.POSIXct(origin) + tvals*3600)
+  else time_vals <- origin + tvals
+}
+
+# Check
+length(time_vals)  # Should now match nlyr(r_stack)
+stopifnot(length(time_vals) == nlyr(r_stack))
+
+month_labels <- format(time_vals, "%Y-%m")
+group_idx <- as.integer(factor(format(time_vals, "%Y-%m"), levels = unique(month_labels)))
+# -----------------------------
+# 9. Aggregate Rasters into Monthly Mean
+# -----------------------------
+unique_months <- unique(month_labels)   # 2000-01, 2000-02, ..., 2014-12
+r_monthly <- tapp(r_stack, index = group_idx, fun = mean, na.rm = TRUE)
+names(r_monthly) <- unique_months
+
+# -----------------------------
+# 10. Convert Raster to Data Frame for ggplot
+# -----------------------------
+r_df <- as.data.frame(r_monthly, xy = TRUE)
+
+r_df_long <- r_df %>%
+  pivot_longer(
+    cols = -c(x, y),
+    names_to = "year_month",
+    values_to = "pr"
+  ) %>%
+  mutate(
+    Year  = substr(year_month, 1, 4),
+    Month = substr(year_month, 6, 7),
+    Month_Name = factor(month.abb[as.integer(Month)], levels = month.abb),
+    Year_Month_Label = paste(Month_Name, Year),
+    
+    # ✅ Convert units to mm/month
+    pr_mm = pr * 60 * 60 * 24 * 30
+  )
+roi_sf <- st_as_sf(roi)   # ROI polygon in sf
+
+# Convert dataframe to data.table
+dt <- as.data.table(r_df_long)
+dt_sf <- st_as_sf(dt, coords = c("x", "y"), crs = 4326, remove = FALSE)
+dt_joined <- st_join(dt_sf, roi_sf, left = TRUE)
+dt_joined <- as.data.table(dt_joined)
+# Convert factors to characters
+cols_factor <- names(dt_joined)[sapply(dt_joined, is.factor)]
+for (col in cols_factor) dt_joined[[col]] <- as.character(dt_joined[[col]])
+
+# Convert any POSIXct or Date columns to character (if exist)
+cols_date <- names(dt_joined)[sapply(dt_joined, inherits, "Date")]
+for (col in cols_date) dt_joined[[col]] <- as.character(dt_joined[[col]])
+dt_joined_clean <- copy(dt_joined)
+dt_joined_clean[, geometry := NULL]
+write_fst(dt_joined_clean, "NEX-GDDP-CMIP6 GFDL-ESM4 pr.fst", compress = 100)
+
+# Calculate monthly mean pr across years
+r_df_monthly <- r_df_long %>% 
+  group_by(x, y, Month_Name) %>% 
+  summarise(mean_pr = mean(pr_mm, na.rm = TRUE), .groups = "drop")
+# -----------------------------
+# 11. Prepare Color Palettes for Mean Precipitation Map
+# ----------------------------
+vmin <- min(r_df_monthly$mean_pr, na.rm = TRUE)
+vmax <- max(r_df_monthly$mean_pr, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(r_df_monthly$mean_pr, n = 18, style = "equal")$brks
+colors <- c(
+  "white",  # cyan
+  "grey",  # green
+  "#96fe07",  # yellow
+  "#ff9f00",
+  "#FFFF00",
+  "#fd1a00"
+)
+# -----------------------------
+# 12. Map Plot (Facetted by Month)
+# -----------------------------
+p <- ggplot(r_df_monthly, aes(x = x, y = y, fill = mean_pr)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,       # gradient will interpolate between these
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 6),
+    labels = scales::label_number(accuracy = 1)
+  )   +
+  coord_sf()+
+  facet_wrap(~Month_Name, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Historical Monthly Mean Precipitation (mm) \n(1960–2014) Pakistan",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: NEX-GDDP-CMIP6") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(1.9, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black"))
+
+
+# -----------------------------
+# 13. Line Plot of Monthly Mean by Year
+# -----------------------------
+setDT(r_df_long)
+r_df_long[, Month_Name := factor(Month_Name, levels = month.abb, ordered = TRUE)]
+
+monthly_mean <- r_df_long[, .(mean_pr = mean(pr_mm, na.rm = TRUE)),
+                          by = .(Year, Month_Name)]
+
+# Add a color variable: 2014 = black, others = grey
+monthly_mean[, color := ifelse(Year == 2014, "2014", "Other")]
+
+line_plot <- ggplot(monthly_mean, aes(x = Month_Name, y = mean_pr, group = Year)) +
+  geom_line(aes(color = color), size = 1) +
+  geom_point(aes(color = color), size = 1) +
+  scale_color_manual(values = c("2014" = "black", "Other" = "grey90")) +
+  labs(title = "(B) Monthly Mean Precipitation \nby Year",
+       x = "Month", y = "Mean Precipitation (mm)", color = "Year") +
+  theme_minimal() + 
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 10)
+  )
+
+
+
+
+#set theme for all graphs
+t1 = theme(
+  panel.spacing = unit(0, "pt"), 
+  panel.grid = element_blank(), 
+  panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+  
+  # ✅ background blank
+  panel.background = element_blank(),
+  plot.background  = element_blank(),
+  
+  plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+  axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+  axis.title = element_text(color = "black", size = 9, face = "bold"), 
+  axis.text.y = element_text(face = "bold", color = "black"), 
+  axis.ticks = element_line(size = 0.1, color = "black"), 
+  
+  legend.justification = c("right", "top"), 
+  legend.background = element_blank(),
+  legend.key = element_blank(),   # ✅ legend ke andar bhi blank background
+  legend.title = element_text(face = "bold"), 
+  legend.text = element_text(size = 10)
+)
+#set theme for all maps
+t2 = theme( panel.grid = element_blank(), 
+            panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+            # ✅ background blank
+            panel.background = element_blank(),
+            plot.background  = element_blank(),
+            strip.text = element_text(color = "black", face = "bold", size = 8), 
+            plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+            axis.text = element_text(color = "black", size = 9), 
+            axis.title = element_text(color = "black", size = 9, face = "bold"), 
+            panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+            legend.key.height = unit(2.0, "cm"), legend.key.width = unit(0.2, "cm"), 
+            legend.title = element_text(size = 8, face = "bold", color = "black"), 
+            legend.text = element_text(size = 10, color = "black") )
+
+dt <- as.data.table(r_df_long)
+
+# Ensure Year/Month are numeric
+dt[, Year := as.numeric(Year)]
+dt[, Month := as.numeric(Month)]
+
+# Annual total precipitation per grid
+annual_total <- dt[, .(PRCPTOT = sum(pr_mm, na.rm=TRUE)), by=.(Year, x, y)]
+
+# Check multiple years per grid
+annual_total[x==61.125 & y==29.375]
+grid_example <- annual_total[x==61.125 & y==29.375]
+
+ggplot(grid_example, aes(x=Year, y=PRCPTOT)) +
+  geom_line(color="blue") +
+  geom_smooth(method="lm", se=FALSE, color="red") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(title="Annual Total Precipitation (PRCPTOT) at 61.125,29.375",
+       x="Year", y="mm")+
+  t1
+
+
+# ---- Spatial map (example: PRCPTOT average over full time period) ----
+indices <- as.data.table(annual_total)  # if you only have PRCPTOT for now
+annual_avg <- indices[, .(PRCPTOT_mean = mean(PRCPTOT, na.rm=TRUE)), by=.(x,y)]
+vmin <- min(annual_avg$PRCPTOT_mean, na.rm = TRUE)
+vmax <- max(annual_avg$PRCPTOT_mean, na.rm = TRUE)
+breaks <- classInt::classIntervals(annual_avg$PRCPTOT_mean, n = 18, style = "equal")$brks
+
+p2 <- ggplot(annual_avg, aes(x=x, y=y, fill=PRCPTOT_mean)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,       # gradient will interpolate between these
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5)
+  )  +
+  coord_sf() +
+  labs(title="Mean Annual Precipitation (1960–2014)", fill="mm")+
+  t2
+
+# 1. Prepare data
+# ------------------------------
+dt <- as.data.table(r_df_long)
+
+# Ensure Year/Month numeric
+dt[, Year := as.numeric(Year)]
+dt[, Month := as.numeric(Month)]
+
+# ------------------------------
+# 2. Calculate precipitation indices
+# ------------------------------
+
+# 2.1 Annual total precipitation (PRCPTOT)
+annual_total <- dt[, .(PRCPTOT = sum(pr_mm, na.rm=TRUE)), by=.(Year, x, y)]
+
+# 2.2 Annual maximum monthly precipitation (Rx1month)
+annual_rx1 <- dt[, .(Rx1month = max(pr_mm, na.rm=TRUE)), by=.(Year, x, y)]
+
+# 2.3 Number of wet months per year (pr >= 1 mm)
+wet_months <- dt[, .(WetMonths = sum(pr_mm >= 1, na.rm=TRUE)), by=.(Year, x, y)]
+
+# 2.4 Consecutive dry months (CDD, pr < 1 mm) with type fix
+dt[, dry := pr_mm < 1]
+cdd <- dt[, .(
+  CDD = {
+    runs <- rle(dry)
+    dry_lengths <- runs$lengths[runs$values]
+    if(length(dry_lengths)==0) as.numeric(0) else as.numeric(max(dry_lengths))
+  }
+), by=.(Year, x, y)]
+
+# 2.5 Annual 95th percentile (R95p)
+annual_p95 <- dt[, .(R95p = quantile(pr_mm, 0.95, na.rm=TRUE)), by=.(Year, x, y)]
+
+# ------------------------------
+# 3. Select grid for line plots
+# ------------------------------
+# Pick first grid with multiple years
+example_grid <- dt[, .N, by=.(x,y)][order(-N)][1]
+grid_x <- example_grid$x
+grid_y <- example_grid$y
+
+# Filter indices for that grid
+grid_PR <- annual_total[x==grid_x & y==grid_y]
+grid_Rx1 <- annual_rx1[x==grid_x & y==grid_y]
+grid_WM <- wet_months[x==grid_x & y==grid_y]
+grid_CDD <- cdd[x==grid_x & y==grid_y]
+grid_R95 <- annual_p95[x==grid_x & y==grid_y]
+
+# ------------------------------
+# 4. Line plots for selected grid
+# ------------------------------
+p1 <- ggplot(grid_PR, aes(x=Year, y=PRCPTOT)) +
+  geom_line(color="blue") + geom_smooth(method="lm", se=FALSE, color="red") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(title="PRCPTOT", x="Year", y="mm")+
+  t1
+
+p2 <- ggplot(grid_Rx1, aes(x=Year, y=Rx1month)) +
+  geom_line(color="darkgreen") + geom_smooth(method="lm", se=FALSE, color="red") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(title="Rx1month", x="Year", y="mm")+
+  t1
+
+p3 <- ggplot(grid_WM, aes(x=Year, y=WetMonths)) +
+  geom_line(color="orange") + geom_smooth(method="lm", se=FALSE, color="red") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(title="Wet Months", x="Year", y="months")+
+  t1
+
+p4 <- ggplot(grid_CDD, aes(x=Year, y=CDD)) +
+  geom_line(color="brown") + geom_smooth(method="lm", se=FALSE, color="red") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(title="Consecutive Dry Months (CDD)", x="Year", y="months")+
+  t1
+
+p5 <- ggplot(grid_R95, aes(x=Year, y=R95p)) +
+  geom_line(color="purple") + geom_smooth(method="lm", se=FALSE, color="red") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  labs(title="R95p (95th percentile)", x="Year", y="mm")+
+  t1
+
+# Combine line plots vertically
+line_plots <- p1 / p2 / p3 / p4 / p5
+line_plots
+
+# ------------------------------
+# 5. Spatial maps (mean over all years)
+# ------------------------------
+map_PR <- annual_total[, .(PRCPTOT_mean = mean(PRCPTOT, na.rm=TRUE)), by=.(x,y)]
+map_Rx1 <- annual_rx1[, .(Rx1month_mean = mean(Rx1month, na.rm=TRUE)), by=.(x,y)]
+map_WM <- wet_months[, .(WetMonths_mean = mean(WetMonths, na.rm=TRUE)), by=.(x,y)]
+map_CDD <- cdd[, .(CDD_mean = mean(CDD, na.rm=TRUE)), by=.(x,y)]
+map_R95 <- annual_p95[, .(R95p_mean = mean(R95p, na.rm=TRUE)), by=.(x,y)]
+
+# Function to plot spatial map
+plot_map <- function(data, value, title){
+  ggplot(data, aes(x=x, y=y, fill=.data[[value]])) +
+    geom_raster() +
+    geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+    scale_fill_gradientn(
+      name = "Pr \n(mm)", 
+      colours = colors) +
+    coord_sf() +
+    labs(title=title, fill=value)+
+    annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+    annotation_north_arrow(location = "tr",
+                           height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                           style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+    labs(
+      x = "Longitude", y = "Latitude",
+      caption = "Source: NEX-GDDP-CMIP6") + 
+    theme( panel.grid = element_blank(), 
+           panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+           # ✅ background blank
+           panel.background = element_blank(),
+           plot.background  = element_blank(),
+           strip.text = element_text(color = "black", face = "bold", size = 8), 
+           plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+           axis.text = element_text(color = "black", size = 9), 
+           axis.title = element_text(color = "black", size = 9, face = "bold"), 
+           panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+           legend.key.height = unit(.60, "cm"), legend.key.width = unit(0.2, "cm"), 
+           legend.title = element_text(size = 8, face = "bold", color = "black"), 
+           legend.text = element_text(size = 10, color = "black") )
+  
+}
+
+m1 <- plot_map(map_PR, "PRCPTOT_mean", "Mean Annual PRCPTOT")
+m2 <- plot_map(map_Rx1, "Rx1month_mean", "Mean Annual Rx1month")
+m3 <- plot_map(map_WM, "WetMonths_mean", "Mean Annual Wet Months")
+m4 <- plot_map(map_CDD, "CDD_mean", "Mean Annual Consecutive Dry Months")
+m5 <- plot_map(map_R95, "R95p_mean", "Mean Annual R95p")
+
+# Combine spatial maps vertically
+spatial_maps <- m1 + m2 + m3 + m4 + m5
+spatial_maps
+
+spatial_maps <- plot_grid(m1, m2, m3, m4, m5,
+                          ncol = 1, align = "v")
+
+line_plots <- plot_grid(p1, p2, p3, p4, p5,
+                        ncol = 1, align = "v")
+
+# Combine left (maps) and right (line plots)
+combined_plot <- plot_grid(
+  spatial_maps, line_plots,
+  ncol = 2, rel_widths = c(1, 1), align = "h"
+)
+
+ggsave(
+  filename = "NEX-GDDP-CMIP6_GFDL-ESM4_Pr.jpeg",
+  plot = combined_plot,
+  width = 7, height = 14, dpi = 300
+)
+
+
