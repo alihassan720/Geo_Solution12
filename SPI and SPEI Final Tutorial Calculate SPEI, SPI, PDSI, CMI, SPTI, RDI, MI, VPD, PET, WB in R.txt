@@ -1,0 +1,808 @@
+library(data.table)
+library(fst)
+library(SPEI)
+library(zoo)
+library(pbapply)
+library(scPDSI)
+library(classInt)
+library(sf)
+library(ggplot2)
+library(ggspatial)
+library(RColorBrewer)
+library(grid)
+library(dplyr)
+library(cowplot)   # for plot_grid()
+# -------------------------------
+# 1️⃣ Load FST datasets
+# -------------------------------
+tmax <- read_fst("NEX-GDDP-CMIP6 GFDL-ESM4 Tmax.fst")
+tmin <- read_fst("NEX-GDDP-CMIP6 GFDL-ESM4 Tmin.fst")
+pr   <- read_fst("NEX-GDDP-CMIP6 GFDL-ESM4 pr.fst")
+
+# Read the data
+tmax <- read_fst("NEX-GDDP-CMIP6 GFDL-ESM4 Tmax.fst", as.data.table = TRUE)
+tmin <- read_fst("NEX-GDDP-CMIP6 GFDL-ESM4 Tmin.fst", as.data.table = TRUE)
+pr   <- read_fst("NEX-GDDP-CMIP6 GFDL-ESM4 pr.fst", as.data.table = TRUE)
+
+tmax_sub <- tmax[, .(x, y, year_month, tasmax_C = tasmax - 273.15)]
+tmin_sub <- tmin[, .(x, y, year_month, tasmin_C = tasmin - 273.15)]
+pr_sub   <- pr[, .(x, y, year_month, pr = as.numeric(pr))]
+
+# Merge all three
+climate_dt <- merge(tmax_sub, tmin_sub, by = c("x","y","year_month"))
+climate_dt <- merge(climate_dt, pr_sub, by = c("x","y","year_month"))
+
+# Ensure numeric
+climate_dt[, x := as.numeric(x)]
+climate_dt[, y := as.numeric(y)]
+climate_dt[, tasmax_C := as.numeric(tasmax_C)]
+climate_dt[, tasmin_C := as.numeric(tasmin_C)]
+climate_dt[, pr := as.numeric(pr)]
+head(climate_dt)
+# Function to fill missing months & calculate SPEI
+fill_missing_months <- function(dt_loc) {
+  dt_loc <- dt_loc[order(year_month)]
+  
+  # Build full time series 1960–2014
+  all_months <- seq(as.Date("1960-01-01"), as.Date("2014-12-01"), by="month")
+  base_dt <- data.table(date = all_months)
+  
+  dt_loc[, date := as.Date(paste0(year_month, "-01"))]
+  dt_loc <- merge(base_dt, dt_loc, by="date", all.x=TRUE)
+  dt_loc[, year_month := format(date, "%Y-%m")]
+  
+  # ✅ Fill x and y (lat/lon) if available
+  if("x" %in% names(dt_loc) && any(!is.na(dt_loc$x))) {
+    dt_loc[, x := zoo::na.locf(zoo::na.locf(x, na.rm=FALSE), fromLast=TRUE)]
+  }
+  if("y" %in% names(dt_loc) && any(!is.na(dt_loc$y))) {
+    dt_loc[, y := zoo::na.locf(zoo::na.locf(y, na.rm=FALSE), fromLast=TRUE)]
+  }
+  
+  # Interpolate climate variables
+  dt_loc[, tasmax_C := zoo::na.approx(tasmax_C, na.rm=FALSE, rule=2)]
+  dt_loc[, tasmin_C := zoo::na.approx(tasmin_C, na.rm=FALSE, rule=2)]
+  dt_loc[, pr       := zoo::na.approx(pr, na.rm=FALSE, rule=2)]
+  
+  return(dt_loc)
+}
+
+climate_spei <- climate_dt[, {
+  dt_filled <- fill_missing_months(.SD)
+  if (is.null(dt_filled)) {
+    NULL
+  } else {
+    # Mean temp
+    tmean <- (dt_filled$tasmax_C + dt_filled$tasmin_C) / 2
+    
+    # PET
+    pet <- SPEI::thornthwaite(Tave = tmean, lat = unique(y))
+    
+    # Water balance (P - PET)
+    balance <- dt_filled$pr - pet
+    
+    # Convert to monthly time series (start year, month 1, freq = 12)
+    balance_ts <- ts(balance, start = c(as.integer(substr(dt_filled$year_month[1],1,4)), 
+                                        as.integer(substr(dt_filled$year_month[1],6,7))), 
+                     frequency = 12)
+    
+    # SPEI for each scale
+    spei_3  <- SPEI::spei(balance_ts, scale = 3)
+    spei_6  <- SPEI::spei(balance_ts, scale = 6)
+    spei_12 <- SPEI::spei(balance_ts, scale = 12)
+    
+    data.table(
+      year_month = dt_filled$year_month,
+      spei_3 = fitted(spei_3),
+      spei_6 = fitted(spei_6),
+      spei_12 = fitted(spei_12)
+    )
+  }
+}, by = .(x, y)]
+
+
+
+#I can extend your SPEI calculation to all commonly used scales: 3, 6, 9, 12, 24, 36 months. 
+#Here's a clean version with progress tracking and quiet execution:
+
+# Function to calculate SPEI for multiple scales quietly
+# calc_spei_multi <- function(dt_loc, scales = c(3,6,9,12,24,36)) {
+#   tmean <- (dt_loc$tasmax_C + dt_loc$tasmin_C) / 2
+#   pet <- SPEI::thornthwaite(Tave = tmean, lat = unique(dt_loc$y))
+#   balance <- dt_loc$pr - pet
+#   
+#   balance_ts <- ts(balance,
+#                    start = c(as.integer(substr(dt_loc$year_month[1],1,4)),
+#                              as.integer(substr(dt_loc$year_month[1],6,7))),
+#                    frequency = 12)
+#   
+#   result <- data.table(year_month = dt_loc$year_month)
+#   
+#   for (s in scales) {
+#     spei_s <- suppressMessages(suppressWarnings(SPEI::spei(balance_ts, scale = s)))
+#     result[, paste0("spei_", s) := as.numeric(fitted(spei_s))]
+#   }
+#   
+#   return(result)
+# }
+# 
+# # Apply to all unique locations with a progress bar
+# unique_locs <- unique(climate_dt[, .(x,y)])
+# climate_spei_list <- pblapply(1:nrow(unique_locs), function(i) {
+#   loc <- unique_locs[i]
+#   dt_sub <- climate_dt[x == loc$x & y == loc$y]
+#   dt_filled <- fill_missing_months(dt_sub)
+#   if (!is.null(dt_filled)) {
+#     res <- calc_spei_multi(dt_filled, scales = c(3,6,9,12,24,36))
+#     res[, `:=`(x = loc$x, y = loc$y)]
+#     return(res)
+#   } else {
+#     return(NULL)
+#   }
+# })
+# 
+# # Combine all results into one data.table
+# climate_spei <- rbindlist(climate_spei_list, use.names = TRUE)
+
+
+#If you want SPI (Standardized Precipitation Index), 
+#it’s simpler because SPI only uses precipitation, 
+#without considering temperature or PET. 
+#So you don’t need the thornthwaite() step or the balance (P - PET). 
+#You just use the precipitation series directly.
+
+climate_spi <- climate_dt[, {
+  dt_filled <- fill_missing_months(.SD)
+  
+  if (is.null(dt_filled)) {
+    NULL
+  } else {
+    # Precipitation time series
+    pr_ts <- ts(dt_filled$pr,
+                start = c(as.integer(substr(dt_filled$year_month[1],1,4)), 
+                          as.integer(substr(dt_filled$year_month[1],6,7))),
+                frequency = 12)
+    
+    # SPI for each scale
+    spi_3  <- SPEI::spi(pr_ts, scale = 3)
+    spi_6  <- SPEI::spi(pr_ts, scale = 6)
+    spi_12 <- SPEI::spi(pr_ts, scale = 12)
+    
+    data.table(
+      year_month = dt_filled$year_month,
+      spi_3  = fitted(spi_3),
+      spi_6  = fitted(spi_6),
+      spi_12 = fitted(spi_12)
+    )
+  }
+}, by = .(x, y)]
+
+
+
+# Function to calculate PDSI for one location
+# 2️⃣ Function to calculate PDSI for a single location
+calc_pdsi_loc <- function(dt_loc, awc = 150) {
+  # Convert to numeric
+  tmean <- as.numeric((dt_loc$tasmax_C + dt_loc$tasmin_C)/2)
+  pr <- as.numeric(dt_loc$pr)
+  
+  # Single latitude value
+  lat <- as.numeric(dt_loc$y[1])
+  
+  # Compute PET using Thornthwaite
+  PE <- SPEI::thornthwaite(Tave = tmean, lat = lat)
+  
+  # Start year and month
+  start_year <- as.integer(substr(dt_loc$year_month[1], 1, 4))
+  start_month <- as.integer(substr(dt_loc$year_month[1], 6, 7))
+  
+  # Convert to time series
+  pr_ts <- ts(pr, start = c(start_year, start_month), frequency = 12)
+  PE_ts <- ts(PE, start = c(start_year, start_month), frequency = 12)
+  
+  # Calculate PDSI
+  pdsi_res <- scPDSI::pdsi(P = pr_ts, PE = PE_ts, AWC = awc)
+  
+  # Extract PDSI values
+  pdsi_values <- pdsi_res$X
+  
+  # Return as data.table
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    PDSI = pdsi_values,
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+
+# 3️⃣ Apply to all locations
+unique_locs <- unique(climate_dt[, .(x, y)])
+pdsi_list <- lapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  
+  if (!is.null(dt_filled)) {
+    message("Processing location: x=", loc$x, ", y=", loc$y)
+    calc_pdsi_loc(dt_filled)
+  } else {
+    NULL
+  }
+})
+
+# 4️⃣ Combine all results
+climate_pdsi <- rbindlist(pdsi_list, use.names = TRUE)
+
+
+
+
+# Function to calculate CMI for one location
+calc_cmi <- function(dt_loc, K = 0.5) {
+  # Mean temperature
+  tmean <- (dt_loc$tasmax_C + dt_loc$tasmin_C)/2
+  
+  # Compute PET using Thornthwaite
+  PE <- SPEI::thornthwaite(Tave = tmean, lat = unique(dt_loc$y))
+  
+  # Precipitation
+  P <- dt_loc$pr
+  
+  # Initialize CMI vector
+  CMI <- numeric(length(P))
+  CMI[1] <- (P[1] - PE[1]) * K  # first month
+  
+  # Recursive calculation
+  for (i in 2:length(P)) {
+    CMI[i] <- CMI[i-1] + (P[i] - PE[i]) * K
+  }
+  
+  # Combine into data.table
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    CMI = CMI,
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+# Unique locations
+unique_locs <- unique(climate_dt[, .(x, y)])
+
+# Calculate CMI for each location
+cmi_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  if (!is.null(dt_filled)) {
+    calc_cmi(dt_filled)
+  } else NULL
+})
+
+# Combine all into one data.table
+climate_cmi <- rbindlist(cmi_list, use.names = TRUE)
+
+
+
+# Function to calculate SPTI for one location
+calc_spti <- function(dt_loc, scale = 3) {
+  # Mean temperature
+  tmean <- (dt_loc$tasmax_C + dt_loc$tasmin_C)/2
+  
+  # Compute PET using Thornthwaite
+  PET <- SPEI::thornthwaite(Tave = tmean, lat = unique(dt_loc$y))
+  
+  # Compute water balance (precipitation - PET)
+  balance <- dt_loc$pr - PET
+  
+  # Convert to monthly time series
+  balance_ts <- ts(balance,
+                   start = c(as.integer(substr(dt_loc$year_month[1], 1, 4)),
+                             as.integer(substr(dt_loc$year_month[1], 6, 7))),
+                   frequency = 12)
+  
+  # Standardize like SPI
+  balance_scaled <- (balance_ts - mean(balance_ts, na.rm = TRUE)) / sd(balance_ts, na.rm = TRUE)
+  
+  # Rolling mean for given scale
+  if (scale > 1) {
+    balance_scaled <- stats::filter(balance_scaled, rep(1/scale, scale), sides = 1)
+  }
+  
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    SPTI = as.numeric(balance_scaled),
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+
+unique_locs <- unique(climate_dt[, .(x, y)])
+
+spti_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  if (!is.null(dt_filled)) {
+    calc_spti(dt_filled, scale = 3)  # you can also calculate for scale = 6, 12 etc.
+  } else NULL
+})
+
+# Combine all results
+climate_spti <- rbindlist(spti_list, use.names = TRUE)
+
+
+#Function to calculate RDI for one location
+calc_rdi <- function(dt_loc, scale = 3) {
+  # Mean temperature
+  tmean <- (dt_loc$tasmax_C + dt_loc$tasmin_C) / 2
+  
+  # Potential evapotranspiration using Thornthwaite
+  PET <- SPEI::thornthwaite(Tave = tmean, lat = unique(dt_loc$y))
+  
+  # Calculate RDI as ratio of precipitation to PET
+  rdi_raw <- dt_loc$pr / PET
+  
+  # Convert to time series
+  rdi_ts <- ts(rdi_raw,
+               start = c(as.integer(substr(dt_loc$year_month[1], 1, 4)),
+                         as.integer(substr(dt_loc$year_month[1], 6, 7))),
+               frequency = 12)
+  
+  # Rolling sum / mean for given scale
+  if (scale > 1) {
+    rdi_ts <- stats::filter(rdi_ts, rep(1/scale, scale), sides = 1)
+  }
+  
+  # Standardize the RDI (mean=0, sd=1)
+  rdi_std <- (rdi_ts - mean(rdi_ts, na.rm = TRUE)) / sd(rdi_ts, na.rm = TRUE)
+  
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    RDI = as.numeric(rdi_std),
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+unique_locs <- unique(climate_dt[, .(x, y)])
+
+rdi_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  if (!is.null(dt_filled)) {
+    calc_rdi(dt_filled, scale = 3)  # You can also compute for scale = 6,12,24 etc.
+  } else NULL
+})
+
+# Combine all results
+climate_rdi <- rbindlist(rdi_list, use.names = TRUE)
+
+#Function for Moisture Index / Climatic Water Balance
+calc_mi <- function(dt_loc) {
+  # Mean temperature
+  tmean <- (dt_loc$tasmax_C + dt_loc$tasmin_C) / 2
+  
+  # Potential evapotranspiration using Thornthwaite
+  PET <- SPEI::thornthwaite(Tave = tmean, lat = unique(dt_loc$y))
+  
+  # Moisture Index / Water Balance
+  mi <- dt_loc$pr - PET
+  
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    MI = mi,
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+unique_locs <- unique(climate_dt[, .(x, y)])
+
+mi_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  if (!is.null(dt_filled)) {
+    calc_mi(dt_filled)
+  } else NULL
+})
+
+# Combine all results into one data.table
+climate_mi <- rbindlist(mi_list, use.names = TRUE)
+
+#Function to calculate VPD for one location
+calc_vpd <- function(dt_loc) {
+  tmax <- dt_loc$tasmax_C
+  tmin <- dt_loc$tasmin_C
+  
+  # Saturation vapor pressure at Tmax
+  es <- 0.6108 * exp((17.27 * tmax) / (tmax + 237.3))
+  
+  # Actual vapor pressure using Tmin (proxy)
+  ea <- 0.6108 * exp((17.27 * tmin) / (tmin + 237.3))
+  
+  # VPD (kPa)
+  vpd <- es - ea
+  
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    VPD = vpd,
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+vpd_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  if (!is.null(dt_filled)) {
+    calc_vpd(dt_filled)
+  } else NULL
+})
+
+# Combine all results
+climate_vpd <- rbindlist(vpd_list, use.names = TRUE)
+
+#Function to calculate PET for one location
+calc_pet <- function(dt_loc) {
+  # Mean monthly temp
+  tmean <- (dt_loc$tasmax_C + dt_loc$tasmin_C) / 2
+  lat <- dt_loc$y[1]   # latitude
+  
+  # PET (mm)
+  pet <- SPEI::thornthwaite(Tave = tmean, lat = lat)
+  
+  dt_out <- data.table(
+    year_month = dt_loc$year_month,
+    PET = as.numeric(pet),
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  
+  return(dt_out)
+}
+pet_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)
+  if (!is.null(dt_filled)) {
+    calc_pet(dt_filled)
+  } else NULL
+})
+
+# Combine into single table
+climate_pet <- rbindlist(pet_list, use.names = TRUE)
+
+# Safe calc_pet for one location (returns data.table with PET and WaterBalance)
+calc_pet_wb <- function(dt_loc) {
+  # ensure ordering and numeric
+  dt_loc <- dt_loc[order(year_month)]
+  dt_loc[, tasmax_C := as.numeric(tasmax_C)]
+  dt_loc[, tasmin_C := as.numeric(tasmin_C)]
+  dt_loc[, pr := as.numeric(pr)]
+  dt_loc[, x := as.numeric(x)]
+  dt_loc[, y := as.numeric(y)]
+  
+  # mean temperature
+  tmean <- as.numeric((dt_loc$tasmax_C + dt_loc$tasmin_C) / 2)
+  lat <- as.numeric(dt_loc$y[1])
+  if (is.na(lat)) {
+    # cannot compute PET without latitude
+    return(NULL)
+  }
+  
+  # Thornthwaite PET (returns monthly PET in mm)
+  pet <- suppressWarnings(suppressMessages(SPEI::thornthwaite(Tave = tmean, lat = lat)))
+  pet <- as.numeric(pet)
+  
+  # Water balance (P - PET)
+  wb <- as.numeric(dt_loc$pr) - pet
+  
+  # build output
+  out <- data.table(
+    year_month = dt_loc$year_month,
+    PET = pet,
+    WaterBalance = wb,
+    x = dt_loc$x[1],
+    y = dt_loc$y[1]
+  )
+  return(out)
+}
+
+# Apply to all locations with progress bar
+unique_locs <- unique(climate_dt[, .(x,y)])
+
+pet_wb_list <- pblapply(1:nrow(unique_locs), function(i) {
+  loc <- unique_locs[i]
+  dt_sub <- climate_dt[x == loc$x & y == loc$y]
+  dt_filled <- fill_missing_months(dt_sub)    # your fill function
+  if (!is.null(dt_filled)) {
+    calc_pet_wb(dt_filled)
+  } else {
+    NULL
+  }
+})
+
+# Combine and clean
+climate_pet_wb <- rbindlist(pet_wb_list, use.names = TRUE, fill = TRUE)
+
+# List of all datasets
+all_indices <- list(
+  climate_spei,
+  climate_spi,
+  climate_pdsi,
+  climate_cmi,
+  climate_spti,
+  climate_rdi,
+  climate_mi,
+  climate_vpd,
+  climate_pet,
+  climate_pet_wb
+)
+
+# Merge them step by step on (x, y, year_month)
+climate_all <- Reduce(function(x, y) merge(x, y,
+                                           by = c("x", "y", "year_month"),
+                                           all = TRUE),
+                      all_indices)
+setDT(climate_all)
+setDT(tmax)
+
+# Find start and end positions
+start_col <- which(names(tmax) == "GID_1")
+end_col   <- which(names(tmax) == "ISO_1")
+
+# Select needed columns
+tmax_extra <- tmax[, c("x", "y", "year_month", names(tmax)[start_col:end_col]), with = FALSE]
+
+# Merge with climate_all
+climate_all <- merge(climate_all, tmax_extra, by = c("x","y","year_month"), all.x = TRUE)
+climate_all[, PET := ifelse(!is.na(PET.x), PET.x, PET.y)]
+climate_all[, c("PET.x", "PET.y") := NULL]  # remove old columns
+
+
+# Convert year_month to year and month
+# Convert year_month to year and month
+climate_all[, c("year", "month") := tstrsplit(year_month, "-", fixed = TRUE)]
+climate_all[, year := as.integer(year)]
+climate_all[, month := as.integer(month)]
+
+# Filter to 1960–2014 and June–Oct
+climate_subset <- climate_all[year %between% c(1960, 2014) & month %in% 6:9]
+
+# Melt to long format
+climate_long <- melt(
+  climate_subset,
+  id.vars = c("x", "y", "year", "month"),
+  measure.vars = c("spei_3", "spei_6", "spei_12"),
+  variable.name = "Index",
+  value.name = "Value"
+)
+index_labels <- c(
+  "spei_3" = "SPEI-3",
+  "spei_6" = "SPEI-6",
+  "spei_12" = "SPEI-12"
+)
+# Calculate mean per cell, month, and index
+climate_mean <- climate_long[, .(Value = mean(Value, na.rm = TRUE)),
+                             by = .(x, y, month, Index)]
+climate_mean[, Value := as.numeric(Value)]
+climate_mean[, Index := as.character(Index)]
+
+# Labels for months
+month_labels <- c(`6` = "June", `7` = "July", `8` = "August", 
+                  `9` = "September")
+
+
+vmin <- min(climate_mean$Value, na.rm = TRUE)
+vmax <- max(climate_mean$Value, na.rm = TRUE)
+breaks <- classInt::classIntervals(climate_mean$Value, n = 18, style = "equal")$brks
+
+# Assign categories
+climate_mean[, Category := cut(
+  Value,
+  breaks = c(-Inf, -0.007, -0.003, 0, 0.003, 0.007, Inf),
+  labels = c("Severe Drought","Moderate Drought","Mild Drought",
+             "Near Normal/Wet","Moderately Wet","Very Wet"),
+  include.lowest = TRUE
+)]
+
+# Define colors
+library(RColorBrewer)
+bluetoorange10 <- rev(brewer.pal(10, "RdYlBu"))
+category_colors <- c(
+  "Severe Drought" = bluetoorange10[1],
+  "Moderate Drought" = bluetoorange10[3],
+  "Mild Drought" = bluetoorange10[5],
+  "Near Normal/Wet" = bluetoorange10[6],
+  "Moderately Wet" = bluetoorange10[8],
+  "Very Wet" = bluetoorange10[10]
+)
+
+# Clean legend labels (replace -Inf / Inf)
+legend_labels <- c(
+  "-0.014 to -0.007", "-0.007 to -0.003", "-0.003 to 0",
+  "0 to 0.003", "0.003 to 0.007", "> 0.007"
+)
+roi <- st_read("gadm41_PAK_1.shp", quiet = TRUE)
+# Plot
+map_plot = ggplot(climate_mean, aes(x = x, y = y, fill = Category)) +
+  geom_raster() +
+  geom_sf(data = roi, inherit.aes = FALSE, fill = NA, color = "black") +
+  coord_sf() +
+  facet_grid(Index ~ month, labeller = labeller(Index = index_labels,
+                                                month = month_labels)) +
+  scale_fill_manual(
+    values = category_colors,
+    labels = legend_labels,
+    na.value = "grey50"
+  ) +
+  labs(fill = "SPEI \nCategory") +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.5, "cm"), width = unit(0.5, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 4, line_width = 0.4)) +
+  labs(title = "(A) Historical Monthly Mean SPEI\nacross Pakistan for 1960–2014",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: NEX-GDDP-CMIP6") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(1.9, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black"))
+
+
+setDT(climate_all)
+
+# 1️⃣ Filter June–Sept & remove NA provinces
+climate_spei <- climate_all[month %in% 6:9 & !is.na(NAME_1),
+                            .(spei_3 = mean(as.numeric(spei_3), na.rm = TRUE),
+                              spei_6 = mean(as.numeric(spei_6), na.rm = TRUE),
+                              spei_12 = mean(as.numeric(spei_12), na.rm = TRUE)),
+                            by = .(year, NAME_1)]
+
+# 2️⃣ Reshape to long format
+climate_spei_long <- melt(climate_spei,
+                          id.vars = c("year","NAME_1"),
+                          measure.vars = c("spei_3","spei_6","spei_12"),
+                          variable.name = "Index",
+                          value.name = "Value")
+
+# 3️⃣ Capitalize Index for plot
+climate_spei_long[, Index := factor(Index, 
+                                    levels = c("spei_3","spei_6","spei_12"),
+                                    labels = c("SPEI_3","SPEI_6","SPEI_12"))]
+
+# 4️⃣ Compute overall mean per province + index
+mean_lines <- climate_spei_long[, .(MeanValue = mean(Value, na.rm = TRUE)),
+                                by = .(NAME_1, Index)]
+
+# 5️⃣ Plot
+ggplot(climate_spei_long, aes(x = year, y = Value, fill = Value)) +
+  geom_col() +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014)) +           # Optional: force axis limits
+  facet_grid(Index ~ NAME_1, scales = "free_y") +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0,
+                       name = "SPEI \nValue") +
+  labs(title = "Mean SPEI (Jun–Sep) by Province",
+       x = "Year", y = "SPEI Value") +
+  theme_bw() +
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.background = element_blank(),
+    plot.background  = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    #legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 10),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", color = "black")
+  )+
+  guides(fill = guide_colorbar(
+    barwidth = 0.5,   # reduce width
+    barheight = 16    # increase height
+  ))
+
+
+
+setDT(climate_all)
+
+# 1️⃣ Compute mean for June–Sept & remove NA provinces
+climate_spei <- climate_all[month %in% 6:9 & !is.na(NAME_1),
+                            .(spei_12 = mean(as.numeric(spei_12), na.rm = TRUE)),
+                            by = .(year, NAME_1)]
+
+# 2️⃣ Convert to long format (optional, only one variable)
+climate_spei_long <- melt(climate_spei,
+                          id.vars = c("year","NAME_1"),
+                          measure.vars = "spei_12",
+                          variable.name = "Index",
+                          value.name = "Value")
+
+# 3️⃣ Capitalize Index
+climate_spei_long[, Index := factor(Index, levels = "spei_12", labels = "SPEI_12")]
+
+# 4️⃣ Prepare data for plotting
+DF <- climate_spei_long %>%
+  mutate(Period = zoo::as.yearmon(paste(year, 1), "%Y %m"),
+         sign = ifelse(Value >= 0, "pos", "neg")) %>%
+  na.omit()
+
+DF <- DF %>%
+  mutate(YearNumeric = as.numeric(format(Period, "%Y")))
+DF_plot <- DF %>% 
+  filter(YearNumeric >= 1960 & YearNumeric <= 2014) %>%
+  na.omit()
+line_plot_fixed = ggplot(DF_plot) +
+  geom_bar(aes(x = YearNumeric, y = Value, col = sign, fill = sign),
+           stat = "identity", position=position_dodge(), show.legend = F) +
+  geom_hline(data = mean_lines, aes(yintercept = MeanValue),
+             color = "black", size = 1) +
+  scale_color_manual(values = c("pos" = "darkblue", "neg" = "red"), name = "SPEI Sign") +
+  scale_fill_manual(values = c("pos" = "darkblue", "neg" = "red"), name = "SPEI Sign") +
+  scale_x_continuous(breaks = seq(1960, 2014, by = 9),   # Customize x-axis breaks
+                     limits = c(1960, 2014), expand = c(0,0)) +  # Remove extra space
+  ylab("SPEI_12") +
+  xlab("Year")+
+  ggtitle("(B) Mean SPEI_12 (Jun–Sep)\n by Province") +
+  facet_wrap(~NAME_1, ncol = 1, scales = "free_y") +
+  theme_bw() +
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.background = element_blank(),
+    plot.background  = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 9, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 9),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", color = "black")
+  )
+
+
+
+combined_plot <- plot_grid(
+  map_plot, line_plot_fixed,
+  ncol = 2, rel_widths = c(3, 0.85),
+  align = "h", axis = "tb"
+)
+
+ggsave(
+  filename = "SPEI.jpeg",
+  plot = combined_plot,
+  width = 14, height = 7, dpi = 300
+)
+
+
