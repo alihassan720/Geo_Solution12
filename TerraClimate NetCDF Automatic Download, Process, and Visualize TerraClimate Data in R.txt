@@ -1,0 +1,512 @@
+# Years and variables
+years <- c(2023, 2024)
+vars <- c("tmax", "tmin", "ppt")
+
+# Loop over variables and years
+for (var in vars) {
+  for (yr in years) {
+    # Create URL and local filename
+    url <- paste0("https://climate.northwestknowledge.net/TERRACLIMATE-DATA/TerraClimate_", var, "_", yr, ".nc")
+    destfile <- paste0("TerraClimate_", var, "_", yr, ".nc")
+    
+    # Download if file does not exist
+    if(!file.exists(destfile)) {
+      download.file(url, destfile, mode = "wb")
+      message("Downloaded: ", destfile)
+    } else {
+      message("File already exists: ", destfile)
+    }
+  }
+}
+# Load libraries
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(lubridate)
+library(ggspatial)
+library(tidyr)
+library(viridis)
+
+# ------------------------
+# 1. Load AOI shapefile
+# ------------------------
+AOI <- st_read("gadm41_PAK_1.shp")
+
+# ------------------------
+# 2. Define NC files
+# ------------------------
+tmax_files <- c("TerraClimate_tmax_2023.nc", "TerraClimate_tmax_2024.nc")
+tmin_files <- c("TerraClimate_tmin_2023.nc", "TerraClimate_tmin_2024.nc")
+ppt_files  <- c("TerraClimate_ppt_2023.nc", "TerraClimate_ppt_2024.nc")
+
+# ------------------------
+# 3. Function to process NC files
+# ------------------------
+process_nc <- function(files, AOI, varname){
+  df_list <- list()
+  
+  # Use CRS of first raster
+  r_ref <- rast(files[1])
+  AOI_proj <- st_transform(AOI, crs(r_ref))
+  
+  for(f in files){
+    r <- rast(f)
+    
+    # Crop & mask to AOI
+    r_crop <- crop(r, AOI_proj)
+    r_mask <- mask(r_crop, AOI_proj)
+    
+    # Convert to data frame long format
+    df <- as.data.frame(r_mask, xy=TRUE) %>%
+      pivot_longer(cols = -c(x,y), names_to="layer", values_to=varname)
+    
+    # Extract proper dates from raster
+    dates <- time(r)
+    df$date <- as.Date(dates[match(df$layer, names(r))])
+    
+    # Keep only needed columns
+    df_list[[f]] <- df %>% select(x, y, date, all_of(varname))
+  }
+  
+  # Combine all years
+  df_all <- bind_rows(df_list)
+  return(df_all)
+}
+
+# ------------------------
+# 4. Process all variables
+# ------------------------
+df_tmax <- process_nc(tmax_files, AOI, "tmax")
+df_tmin <- process_nc(tmin_files, AOI, "tmin")
+df_ppt  <- process_nc(ppt_files,  AOI, "ppt")
+
+# ------------------------
+# 5. Merge variables
+# ------------------------
+df_all <- df_tmax %>%
+  left_join(df_tmin, by=c("x","y","date")) %>%
+  left_join(df_ppt,  by=c("x","y","date"))
+
+# ------------------------
+# 6. Add day, month, year
+# ------------------------
+df_all <- df_all %>%
+  mutate(
+    day   = day(date),
+    month = month(date),
+    year  = year(date)
+  )
+# Example: Map of January 2023 tmax
+
+# ------------------------
+# 1. Define seasons
+# ------------------------
+df_all <- df_all %>%
+  mutate(
+    season = case_when(
+      month %in% c(12,1,2) ~ "DJF",
+      month %in% c(3,4,5)  ~ "MAM",
+      month %in% c(6,7,8)  ~ "JJA",
+      month %in% c(9,10,11)~ "SON"
+    )
+  )
+
+# ------------------------
+# 2. Seasonal aggregation (mean) per grid cell
+# ------------------------
+# 1. Compute seasonal means per grid cell
+df_season <- df_all %>%
+  group_by(x, y, year, season) %>%
+  summarise(
+    tmax_mean = mean(tmax, na.rm = TRUE),
+    tmin_mean = mean(tmin, na.rm = TRUE),
+    ppt_mean  = mean(ppt,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+vmin <- min(df_season$ppt_mean, na.rm = TRUE)
+vmax <- max(df_season$ppt_mean, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(df_season$ppt_mean, n = 18, style = "equal")$brks
+colors <- c(
+  "white",  # cyan
+  "grey",  # green
+  "#96fe07",  # yellow
+  "#ff9f00",
+  "#FFFF00",
+  "#fd1a00"
+)
+
+# 2. Plot with geom_tile (heatmap-style)
+p1 = ggplot(df_season %>% filter(year == 2023), 
+       aes(x = x, y = y, fill = ppt_mean)) +
+  geom_tile() +
+  facet_wrap(~season) +
+  geom_sf(data = AOI, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,       # gradient will interpolate between these
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 6),
+    labels = scales::label_number(accuracy = 1)
+  )  +
+  coord_sf() +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Seasonal Mean Precipitation (2023)",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: TerraClimate") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(1.9, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black"))
+
+# ------------------------
+# 4. Seasonal mean time series (mean over AOI)
+# ------------------------
+df_season_ts <- df_season %>%
+  group_by(year, season) %>%
+  summarise(
+    tmax_mean_AOI = mean(tmax_mean, na.rm=TRUE),
+    tmin_mean_AOI = mean(tmin_mean, na.rm=TRUE),
+    ppt_mean_AOI  = mean(ppt_mean, na.rm=TRUE)
+  ) %>%
+  ungroup()
+
+# Temperature line plot
+ggplot(df_season_ts, aes(x=season)) +
+  geom_line(aes(y=tmax_mean_AOI, group=year, color=factor(year)), size=1) +
+  geom_line(aes(y=tmin_mean_AOI, group=year, color=factor(year)), linetype="dashed") +
+  labs(title="Seasonal Mean Tmax & Tmin over AOI",
+       x="Season", y="Temperature (°C)", color="Year") +
+  theme_minimal()
+
+# Precipitation plot
+ggplot(df_season_ts, aes(x=season, y=ppt_mean_AOI, group=year, color=factor(year))) +
+  geom_line(size=1) +
+  geom_point() +
+  labs(title="Seasonal Mean Precipitation over AOI",
+       x="Season", y="Precipitation (mm)", color="Year") +
+  theme_minimal()
+
+
+# --- 1. Compute seasonal means per grid cell ---
+df_season <- df_all %>%
+  group_by(x, y, year, season) %>%
+  summarise(
+    tmax_mean = mean(tmax, na.rm = TRUE),
+    tmin_mean = mean(tmin, na.rm = TRUE),
+    ppt_mean  = mean(ppt,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- 2. Pivot wider for year comparison ---
+df_wide <- df_season %>%
+  pivot_wider(
+    id_cols = c(x, y, season),
+    names_from = year,
+    values_from = c(tmax_mean, tmin_mean, ppt_mean),
+    names_sep = "_"
+  )
+
+# --- 3. Compute change between 2023 → 2024 ---
+df_change <- df_wide %>%
+  mutate(
+    d_tmax = tmax_mean_2024 - tmax_mean_2023,
+    d_tmin = tmin_mean_2024 - tmin_mean_2023,
+    d_ppt  = ppt_mean_2024  - ppt_mean_2023,
+    index_flag = case_when(
+      d_tmax > 0 & d_ppt > 0 ~ "Hotter + Wetter",
+      d_tmax > 0 & d_ppt < 0 ~ "Hotter + Drier",
+      d_tmax < 0 & d_ppt > 0 ~ "Cooler + Wetter",
+      d_tmax < 0 & d_ppt < 0 ~ "Cooler + Drier",
+      TRUE ~ "No Change"
+    )
+  )
+
+# --- 4. Plot using geom_tile ---
+p2 = ggplot(df_change, aes(x = x, y = y, fill = index_flag)) +
+  geom_tile() +
+  geom_sf(data = AOI, inherit.aes = FALSE, fill = NA, color = "black") +
+  facet_wrap(~ season) +
+  scale_fill_manual(values = c(
+    "Hotter + Wetter" = "#e41a1c",
+    "Hotter + Drier"  = "#ff7f00",
+    "Cooler + Wetter" = "#377eb8",
+    "Cooler + Drier"  = "#984ea3",
+    "No Change"       = "grey80"
+  )) +
+  coord_sf() +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Seasonal Climate Change (2024–2023)",
+       fill = "Change Type",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: NEX-GDDP-CMIP6") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(.7, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 8, color = "black"))
+
+
+# --- Aggregate by season and year across all grid cells ---
+df_summary <- df_season %>%
+  group_by(season, year) %>%
+  summarise(
+    tmax_mean = mean(tmax_mean, na.rm = TRUE),
+    tmin_mean = mean(tmin_mean, na.rm = TRUE),
+    ppt_mean  = mean(ppt_mean,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Pivot longer for ggplot
+df_summary_long <- df_summary %>%
+  tidyr::pivot_longer(
+    cols = c(tmax_mean, tmin_mean, ppt_mean),
+    names_to = "variable",
+    values_to = "value"
+  )
+# Pivot longer for ggplot
+df_summary_long <- df_summary %>%
+  tidyr::pivot_longer(
+    cols = c(tmax_mean, tmin_mean, ppt_mean),
+    names_to = "variable",
+    values_to = "value"
+  )
+
+ggplot(df_summary_long, aes(x = season, y = value, fill = factor(year))) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ variable, scales = "free_y",
+             labeller = labeller(variable = c(
+               tmax_mean = "Tmax (°C)",
+               tmin_mean = "Tmin (°C)",
+               ppt_mean  = "Precipitation (mm)"
+             ))) +
+  scale_fill_manual(values = c("2023" = "#1f77b4", "2024" = "#ff7f0e")) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "(B) Seasonal Mean Climate \nComparison (2023 vs 2024)",
+    x = "Season",
+    y = "Mean Value",
+    fill = "Year"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 8, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    #legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 8)
+  )
+df_change_summary <- df_summary %>%
+  tidyr::pivot_wider(
+    names_from = year,
+    values_from = c(tmax_mean, tmin_mean, ppt_mean)
+  ) %>%
+  mutate(
+    d_tmax = tmax_mean_2024 - tmax_mean_2023,
+    d_tmin = tmin_mean_2024 - tmin_mean_2023,
+    d_ppt  = ppt_mean_2024  - ppt_mean_2023
+  ) %>%
+  select(season, starts_with("d_")) %>%
+  tidyr::pivot_longer(
+    cols = starts_with("d_"),
+    names_to = "variable",
+    values_to = "change"
+  )
+
+p3 = ggplot(df_change_summary, aes(x = season, y = change, fill = variable)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("d_tmax" = "red", "d_tmin" = "blue", "d_ppt" = "skyblue")) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "(B) Change (2024 – 2023) in Seasonal Means",
+    x = "Season",
+    y = "Change",
+    fill = "Variable"
+  ) +
+  theme_minimal()+
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    #legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 10)
+  )
+
+
+# 1. Seasonal means per grid cell
+seasonal_df <- df_all %>%
+  group_by(x, y, year, season) %>%
+  summarise(
+    tmax_mean = mean(tmax, na.rm = TRUE),
+    tmin_mean = mean(tmin, na.rm = TRUE),
+    ppt_mean  = mean(ppt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 2. Seasonal averages across all points (for anomalies)
+# 1. Seasonal averages
+seasonal_avg <- seasonal_df %>%
+  group_by(season) %>%
+  summarise(
+    tmax_season_avg = mean(tmax_mean, na.rm = TRUE),
+    tmin_season_avg = mean(tmin_mean, na.rm = TRUE),
+    ppt_season_avg  = mean(ppt_mean, na.rm = TRUE)
+  )
+
+# 2. Compute anomalies and TPAI
+seasonal_df <- seasonal_df %>%
+  left_join(seasonal_avg, by = "season") %>%
+  mutate(
+    tmax_anom = tmax_mean - tmax_season_avg,
+    tmin_anom = tmin_mean - tmin_season_avg,
+    ppt_anom  = ppt_mean  - ppt_season_avg,
+    TPAI      = (tmax_anom + tmin_anom) / (ppt_anom + 1)
+  )
+
+# 3. Convert to sf and define categories
+seasonal_sf <- st_as_sf(seasonal_df, coords = c("x", "y"), crs = 4326)
+seasonal_sf <- seasonal_sf %>%
+  mutate(TPAI_cat = cut(TPAI, breaks = c(-Inf, -0.2, 0.2, Inf),
+                        labels = c("Cooler/Wetter", "Near Normal", "Hotter/Drier")))
+
+# 4. Prepare data frame with coordinates
+df_tile <- seasonal_sf %>%
+  st_drop_geometry() %>%
+  mutate(x = seasonal_df$x,
+         y = seasonal_df$y)
+
+# 5. Tile plot (raster-style map)
+p4 = ggplot(df_tile, aes(x = x, y = y, fill = TPAI_cat)) +
+  geom_tile() +
+  geom_sf(data = AOI, inherit.aes = FALSE, fill = NA, color = "black") +
+  facet_wrap(~season) +
+  scale_fill_manual(values = c(
+    "Cooler/Wetter" = "#1f78b4",
+    "Near Normal"   = "#b2df8a",
+    "Hotter/Drier"  = "#e31a1c"
+  )) +
+  coord_sf() +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(C) Seasonal TPAI Categories",
+       fill = "TPAI Category",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: TerraClimate") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(.9, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 8, color = "black"))
+
+
+# Prepare data: proportion per season
+df_graph <- seasonal_sf %>%
+  st_drop_geometry() %>%
+  group_by(season, TPAI_cat) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(season) %>%
+  mutate(prop = count / sum(count) * 100) %>%
+  ungroup() %>%
+  mutate(season = factor(season, levels = c("DJF", "MAM", "JJA", "SON")))
+
+# Plot proportional stacked bar with labels
+p5 = ggplot(df_graph, aes(x = season, y = prop, fill = TPAI_cat)) +
+  geom_bar(stat = "identity", color = "black") +
+  geom_text(aes(label = paste0(round(prop, 1), "%")), 
+            position = position_stack(vjust = 0.5), size = 3) +
+  scale_fill_manual(values = c(
+    "Cooler/Wetter" = "#1f78b4",
+    "Near Normal"   = "#b2df8a",
+    "Hotter/Drier"  = "#e31a1c"
+  )) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(
+    title = "(D) Proportional Seasonal Distribution of TPAI Categories",
+    x = "Season",
+    y = "Percentage of Grid Points",
+    fill = "TPAI Category"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA), 
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black"), 
+    #legend.position = c(0.9, 0.9), 
+    legend.justification = c("right", "top"), 
+    legend.background = element_blank(), 
+    legend.title = element_text(face = "bold"), 
+    legend.text = element_text(size = 8)
+  )
+
+# Combine first row
+row1 <- plot_grid(p2, p3, ncol = 2, rel_widths = c(2, 1))
+# Combine second row
+row2 <- plot_grid(p4, p5, ncol = 2, rel_widths = c(2, 1))
+# Combine both rows
+combined_plot <- plot_grid(row1, row2, ncol = 1)
+
+# Save
+ggsave(
+  filename = "TerraClimate.jpeg",
+  plot = combined_plot,
+  width = 12,
+  height = 14,
+  dpi = 300
+)
