@@ -1,0 +1,259 @@
+# Create a folder for saving downloaded files
+dir.create("gridmet_data", showWarnings = FALSE)
+
+# Variables and years you want
+vars <- c("pr", "tmmx", "tmmn")
+years <- c(2024, 2025)
+
+# Loop to download
+for (v in vars) {
+  for (y in years) {
+    file_name <- paste0(v, "_", y, ".nc")
+    url <- paste0("https://www.northwestknowledge.net/metdata/data/", file_name)
+    dest <- file.path("gridmet_data", file_name)
+    
+    # Download file if it doesn't already exist
+    if (!file.exists(dest)) {
+      message("Downloading ", file_name, " ...")
+      download.file(url, destfile = dest, mode = "wb")
+    } else {
+      message(file_name, " already exists, skipping.")
+    }
+  }
+}
+
+message("✅ All requested gridMET files downloaded successfully!")
+
+library(terra)
+library(sf)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(data.table)
+library(ggplot2)
+library(ggspatial)
+library(cowplot)
+library(patchwork)
+# --- Step 1: Read shapefile ---
+usa <- st_read("gadm41_USA_2.shp")
+shp <- usa %>%
+  filter(NAME_1 == "Missouri") %>%
+  st_transform(4326)
+
+# --- Step 2: List and read NetCDF files ---
+nc_files <- c("./pr_2024.nc", "./pr_2025.nc",
+              "./tmmn_2024.nc", "./tmmn_2025.nc",
+              "./tmmx_2024.nc", "./tmmx_2025.nc")
+
+pr   <- rast(nc_files[grep("pr", nc_files)])
+tmmn <- rast(nc_files[grep("tmmn", nc_files)])
+tmmx <- rast(nc_files[grep("tmmx", nc_files)])
+
+# --- Step 3: Crop & mask to Missouri ---
+pr   <- mask(crop(pr, shp), shp)
+tmmn <- mask(crop(tmmn, shp), shp)
+tmmx <- mask(crop(tmmx, shp), shp)
+
+# --- Step 4: Generate correct daily time vectors ---
+time_pr   <- seq(as.Date("2024-01-01"), by = "day", length.out = nlyr(pr))
+time_tmmn <- seq(as.Date("2024-01-01"), by = "day", length.out = nlyr(tmmn))
+time_tmmx <- seq(as.Date("2024-01-01"), by = "day", length.out = nlyr(tmmx))
+
+# --- Step 5: Compute monthly mean rasters (pixel-level) ---
+pr_monthly   <- tapp(pr,   as.factor(format(time_pr, "%Y-%m")), mean)
+tmmn_monthly <- tapp(tmmn, as.factor(format(time_tmmn, "%Y-%m")), mean)
+tmmx_monthly <- tapp(tmmx, as.factor(format(time_tmmx, "%Y-%m")), mean)
+
+names(pr_monthly)   <- unique(format(time_pr, "%Y-%m"))
+names(tmmn_monthly) <- unique(format(time_tmmn, "%Y-%m"))
+names(tmmx_monthly) <- unique(format(time_tmmx, "%Y-%m"))
+
+# --- Step 6: Convert temperatures to °C ---
+tmmn_monthly <- tmmn_monthly - 273.15
+tmmx_monthly <- tmmx_monthly - 273.15
+
+# --- Step 7: Convert rasters to data frames ---
+df_pr   <- as.data.frame(pr_monthly, xy = TRUE)
+df_tmmn <- as.data.frame(tmmn_monthly, xy = TRUE)
+df_tmmx <- as.data.frame(tmmx_monthly, xy = TRUE)
+
+# --- Step 8: Reshape to long format ---
+df_pr_long   <- df_pr %>% pivot_longer(-c(x, y), names_to = "date", values_to = "pr")
+df_tmmn_long <- df_tmmn %>% pivot_longer(-c(x, y), names_to = "date", values_to = "tmmn")
+df_tmmx_long <- df_tmmx %>% pivot_longer(-c(x, y), names_to = "date", values_to = "tmmx")
+
+# --- Step 9: Merge all variables ---
+df_all <- df_pr_long %>%
+  left_join(df_tmmn_long, by = c("x", "y", "date")) %>%
+  left_join(df_tmmx_long, by = c("x", "y", "date")) %>%
+  mutate(date = as.Date(paste0(date, "-15")))  # middle of month
+
+
+# Convert to data.table
+dt_all <- as.data.table(df_all)
+
+# Extract day, month, year
+dt_all[, `:=`(
+  day   = day(date),
+  month = month(date),
+  year  = year(date)
+)]
+
+# Optional: reorder columns
+setcolorder(dt_all, c("x", "y", "year", "month", "day", "pr", "tmmn", "tmmx"))
+
+# dt_all already has x, y, year, month, day, pr, tmmn, tmmx
+# Compute monthly average across years
+dt_monthly <- dt_all[, .(
+  pr_avg   = mean(pr, na.rm = TRUE),
+  tmmn_avg = mean(tmmn, na.rm = TRUE),
+  tmmx_avg = mean(tmmx, na.rm = TRUE)
+), by = .(x, y, month)]
+
+# Convert month number to ordered factor for plotting
+dt_monthly[, month := factor(month, levels = 1:12, labels = month.abb)]
+
+vmin <- min(dt_monthly$pr_avg, na.rm = TRUE)
+vmax <- max(dt_monthly$pr_avg, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(dt_monthly$pr_avg, n = 18, style = "equal")$brks
+
+colors <- c("#EE82EE", "#8A2BE2", "#00FFFF", "#00FF00", "#FFFF00", "#FF0000")
+
+# -----------------------------
+# 12. Map Plot (Facetted by Month)
+# -----------------------------
+p <- ggplot(dt_monthly, aes(x = x, y = y, fill = pr_avg)) +
+  geom_raster() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,       # gradient will interpolate between these
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 6),
+    labels = scales::label_number(accuracy = 1)
+  )   +
+  coord_sf()+
+  # Reduce number of longitude (x) and latitude (y) breaks
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  facet_wrap(~month, ncol = 4) +
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Historical Monthly Mean Precipitation (mm) \n(2024–2025) Missouri",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: gridMET") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 7), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(1.9, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black"))
+
+
+library(randomForest)
+library(pdp)
+library(ggplot2)
+library(ggpubr)
+# 1. Aggregate monthly data
+# -----------------------------
+dt_monthly <- dt_all[, .(
+  pr = sum(pr, na.rm = TRUE),             # total monthly precipitation
+  tmmx = mean(tmmx, na.rm = TRUE),        # average Tmax
+  tmmn = mean(tmmn, na.rm = TRUE)         # average Tmin
+), by = .(year, month)]
+
+# -----------------------------
+# 2. Ensure numeric columns
+# -----------------------------
+dt_monthly[, `:=`(
+  pr = as.numeric(pr),
+  tmmx = as.numeric(tmmx),
+  tmmn = as.numeric(tmmn)
+)]
+
+# -----------------------------
+# 3. Remove rows with NA (Random Forest cannot handle NA)
+# -----------------------------
+dt_monthly <- na.omit(dt_monthly)
+
+# -----------------------------
+# 4. Fit Random Forest
+# -----------------------------
+rf_model <- randomForest(pr ~ tmmx + tmmn, data = as.data.frame(dt_monthly), ntree = 500)
+
+# Partial dependence data
+pdp_tmax <- partial(rf_model, pred.var = "tmmx", train = dt_monthly)
+pdp_tmin <- partial(rf_model, pred.var = "tmmn", train = dt_monthly)
+
+# Custom plots with ggplot (more scientific style)
+p1 <- ggplot(pdp_tmax, aes(x = tmmx, y = yhat)) +
+  geom_line(color = "darkred", linewidth = 1.2) +
+  geom_smooth(method = "loess", se = TRUE, color = "black", linetype = "dashed") +
+  scale_x_continuous(
+    name = "Tmax (°C)",
+    breaks = pretty(pdp_tmax$tmmx),           # ensures readable tick marks
+    expand = expansion(mult = c(0, 0.02))     # ensures min and max are visible
+  ) +
+  scale_y_continuous(
+    name = "Predicted Precipitation (mm)",
+    breaks = pretty(pdp_tmax$yhat),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(title = "(B) Effect of Tmax on Precipitation") +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold"),
+    axis.title = element_text(color = "black", size = 9, face = "bold"),
+    axis.ticks = element_line(size = 0.3, color = "black")
+  )
+p2 <- ggplot(pdp_tmin, aes(x = tmmn, y = yhat)) +
+  geom_line(color = "darkblue", linewidth = 1.2) +
+  geom_smooth(method = "loess", se = TRUE, color = "black", linetype = "dashed") +
+  scale_x_continuous(
+    name = "Tmin (°C)",
+    breaks = pretty(pdp_tmin$tmmn),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_y_continuous(
+    name = "Predicted Precipitation (mm)",
+    breaks = pretty(pdp_tmin$yhat),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(title = "(C) Effect of Tmin on Precipitation") +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0, "pt"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold"),
+    axis.title = element_text(color = "black", size = 9, face = "bold"),
+    axis.ticks = element_line(size = 0.3, color = "black")
+  )
+ggarrange(p1/ p2, ncol = 2)
+
+combined_plot <- plot_grid(
+  p, p1/p2,
+  ncol = 2, rel_widths = c(1, .49),
+  align = "h", axis = "tblr"
+)
+
+ggsave(
+  filename = "gridMET.jpeg",
+  plot = combined_plot,
+  width = 15, height = 8, dpi = 300
+)
