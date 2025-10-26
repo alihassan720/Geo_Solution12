@@ -1,0 +1,632 @@
+
+variables <- c("pr", "tasmin", "tasmax")
+models    <- c("GFDL-ESM2G")  
+scenarios <- c("historical", "rcp45", "rcp85")
+# Time period mapping for each scenario
+time_periods <- list(
+  historical = c("1990_2005"),
+  rcp45 = c("2006_2025", "2026_2045"),
+  rcp85 = c("2006_2025", "2026_2045")
+)
+domain <- "CONUS"
+freq <- "monthly"
+
+make_url <- function(var, model, scenario, period) {
+  # Example template
+  # “macav2livneh_${var}_${model}_r1i1p1_${scenario}_${period}_${domain}_${freq}.nc”
+  fname <- paste0(
+    "macav2livneh_",
+    var, "_",
+    model, "_r1i1p1_",
+    scenario, "_",
+    period, "_",
+    domain, "_",
+    freq, ".nc"
+  )
+  base <- "http://thredds.northwestknowledge.net:8080/thredds/fileServer/NWCSC_INTEGRATED_SCENARIOS_ALL_CLIMATE/macav2livneh"
+  url <- paste(base, model, fname, sep = "/")
+  return(url)
+}
+
+all_urls <- c()
+for (var in variables) {
+  for (model in models) {
+    for (sc in scenarios) {
+      for (per in time_periods[[sc]]) {
+        u <- make_url(var, model, sc, per)
+        all_urls <- c(all_urls, u)
+      }
+    }
+  }
+}
+# Then directly start downloading
+for (u in all_urls) {
+  file_name <- basename(u)
+  tryCatch({
+    download.file(u, destfile = file_name, mode = "wb", quiet = TRUE)
+    cat("✅ Downloaded:", file_name, "\n")
+  }, error = function(e) {
+    cat("❌ Failed to download:", file_name, "\n")
+  })
+}
+library(terra)
+library(sf)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(data.table)
+library(ggplot2)
+library(ggspatial)
+library(cowplot)
+library(patchwork)
+library(scales)
+
+# --- Step 1: Read shapefile ---
+usa <- st_read("gadm41_USA_2.shp")
+shp <- usa %>%
+  filter(NAME_1 == "Missouri") %>%
+  st_transform(4326)
+
+# --- Step 2: List all MACA .nc files ---
+nc_files <- list.files(pattern = "\\.nc$", full.names = TRUE)
+
+# --- Helper functions ---
+get_var_name <- function(f) {
+  if (grepl("pr_", f)) return("pr")
+  if (grepl("tasmin_", f)) return("tasmin")
+  if (grepl("tasmax_", f)) return("tasmax")
+  return(NA)
+}
+
+get_scenario <- function(f) {
+  if (grepl("historical", f)) return("historical")
+  if (grepl("rcp45", f)) return("rcp45")
+  if (grepl("rcp85", f)) return("rcp85")
+  return(NA)
+}
+
+# --- Step 3: Process each file ---
+all_data <- list()
+
+for (f in nc_files) {
+  cat("📂 Processing:", f, "\n")
+  
+  varname <- get_var_name(f)
+  scenario <- get_scenario(f)
+  
+  r <- rast(f)
+  r_crop <- crop(r, vect(shp))
+  r_mask <- mask(r_crop, vect(shp))
+  
+  # Extract data and time
+  df <- as.data.frame(r_mask, xy = TRUE)
+  names(df) <- gsub("X", "", names(df))
+  time_vals <- time(r)
+  
+  df_long <- melt(
+    setDT(df),
+    id.vars = c("x", "y"),
+    variable.name = "time",
+    value.name = varname
+  )
+  
+  df_long$date <- as.Date(time_vals[df_long$time])
+  df_long[, c("scenario") := scenario]
+  
+  # Save by variable + scenario (not period)
+  nm <- paste0(varname, "_", scenario)
+  
+  # Combine 2006–2025 and 2026–2045 within same scenario
+  if (nm %in% names(all_data)) {
+    all_data[[nm]] <- rbindlist(list(all_data[[nm]], df_long[, .(x, y, date, value = get(varname), scenario)]))
+  } else {
+    all_data[[nm]] <- df_long[, .(x, y, date, value = get(varname), scenario)]
+  }
+}
+
+# --- Step 4: Prepare and merge all datasets ---
+for (nm in names(all_data)) {
+  # Remove 'scenario' column before merging to avoid duplication
+  all_data[[nm]][, scenario := NULL]
+  
+  # Rename 'value' to variable name (e.g., pr_rcp45)
+  setnames(all_data[[nm]], "value", nm)
+}
+
+# Merge all datasets by coordinates + date
+combined <- Reduce(function(x, y)
+  merge(x, y, by = c("x", "y", "date"), all = TRUE),
+  all_data)
+
+# --- Step 5: Rebuild scenario column ---
+combined[, scenario := fifelse(!is.na(pr_historical) | !is.na(tasmin_historical) | !is.na(tasmax_historical), "historical",
+                               fifelse(!is.na(pr_rcp45) | !is.na(tasmin_rcp45) | !is.na(tasmax_rcp45), "rcp45",
+                                       fifelse(!is.na(pr_rcp85) | !is.na(tasmin_rcp85) | !is.na(tasmax_rcp85), "rcp85", NA_character_)))]
+
+# --- Step 6: Reorder columns for clarity ---
+setcolorder(combined, c("x", "y", "date", "scenario",
+                        grep("pr_|tasmin_|tasmax_", names(combined), value = TRUE)))
+
+cat("✅ Combined dataset ready — duplicates removed and all RCP periods merged successfully.\n")
+
+
+# 5️⃣ Split date column
+# Ensure 'date' is a Date type
+combined[, date := as.Date(date)]
+
+# Extract year, month, and day
+combined[, `:=`(
+  year = year(date),
+  month = month(date),
+  day = day(date)
+)]
+
+# Optional: Reorder columns for clarity
+setcolorder(combined, c("x", "y", "date", "year", "month", "day", "scenario",
+                        grep("pr_|tasmin_|tasmax_", names(combined), value = TRUE)))
+
+
+# Step 1: Convert to data.table
+dt <- as.data.table(combined)
+
+# Step 2: Filter April, May, June, November
+dt_season <- dt[month %in% c(4,5,6,11)]
+
+# Step 3: Compute mean per x,y for each scenario
+mean_pr <- dt_season[, .(
+  pr_hist = mean(pr_historical, na.rm = TRUE),
+  pr_45   = mean(pr_rcp45, na.rm = TRUE),
+  pr_85   = mean(pr_rcp85, na.rm = TRUE)
+), by = .(x, y, month)]
+
+# Step 4: Convert to long format for facet_grid
+mean_pr_long <- melt(mean_pr, id.vars = c("x", "y", "month"),
+                     measure.vars = c("pr_hist", "pr_45", "pr_85"),
+                     variable.name = "scenario", value.name = "precip")
+
+# Step 5: Rename scenarios
+mean_pr_long[, scenario := factor(scenario,
+                                  levels = c("pr_hist", "pr_45", "pr_85"),
+                                  labels = c("Historical", "RCP 4.5", "RCP 8.5"))]
+
+# Step 6: Convert month to factor with names
+mean_pr_long[, month := factor(month, levels = c(4,5,6,11),
+                               labels = c("April", "May", "June", "November"))]
+
+# Step 7: extract coordinates
+mean_pr_long_dt <- as.data.table(mean_pr_long)
+
+vmin <- min(mean_pr_long_dt$precip, na.rm = TRUE)
+vmax <- max(mean_pr_long_dt$precip, na.rm = TRUE)
+
+breaks <- classInt::classIntervals(mean_pr_long_dt$precip, n = 18, style = "equal")$brks
+colors <- c("#EE82EE", "#8A2BE2", "#00FFFF", "#00FF00", "#FFFF00", "#FF0000")
+# Plot using geom_tile
+p = ggplot(mean_pr_long_dt, aes(x = x, y = y, fill = precip)) +
+  geom_tile() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip.\n(mm)", colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = 1)
+  )  +
+  facet_grid(scenario ~ month) +
+  coord_sf() +
+  # Reduce number of longitude (x) and latitude (y) breaks
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  theme_minimal() +
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(location = "tr",
+                         height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+                         style = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)) +
+  labs(title = "(A) Mean Precipitation for Selected Months\n Missouri",
+       x = "Longitude", y = "Latitude",
+       caption = "Source: MACA") + 
+  theme( panel.grid = element_blank(), 
+         panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA), 
+         strip.text = element_text(color = "black", face = "bold", size = 8), 
+         plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+         axis.text = element_text(color = "black", size = 9), 
+         axis.title = element_text(color = "black", size = 9, face = "bold"), 
+         panel.spacing = unit(0, "cm"), axis.ticks = element_line(size = 0.1, color = "black"), 
+         legend.key.height = unit(2.2, "cm"), legend.key.width = unit(0.2, "cm"), 
+         legend.title = element_text(size = 8, face = "bold", color = "black"), 
+         legend.text = element_text(size = 10, color = "black") )
+
+
+# Copy and filter July–August
+# --- Step 1: Filter July & August ---
+pr_data <- combined[month %in% c(7,8)]
+
+# --- Step 2: Compute mean across July & August for each year and scenario ---
+pr_mean <- pr_data[, .(
+  pr_historical = mean(pr_historical, na.rm = TRUE),
+  pr_rcp45 = mean(pr_rcp45, na.rm = TRUE),
+  pr_rcp85 = mean(pr_rcp85, na.rm = TRUE)
+), by = year]
+
+# --- Step 3: Convert to long format for easier ggplot use ---
+pr_long <- melt(
+  pr_mean,
+  id.vars = "year",
+  variable.name = "scenario",
+  value.name = "pr"
+)
+
+# --- Step 4: Clean scenario labels for legend ---
+pr_long[, scenario := fcase(
+  scenario == "pr_historical", "Historical",
+  scenario == "pr_rcp45", "RCP 4.5",
+  scenario == "pr_rcp85", "RCP 8.5"
+)]
+
+# --- Step 5: Plot ---
+# Drop missing values for plotting
+pr_long_clean <- na.omit(pr_long)
+# Copy data
+pr_long_cont <- copy(pr_long_clean)
+
+# Ensure scenario is a factor with correct levels
+pr_long_cont[, scenario := factor(trimws(scenario), levels = c("Historical", "RCP 4.5", "RCP 8.5"))]
+
+# Fill missing RCP rows for 2005 using Historical value (so lines connect)
+historical_2005 <- pr_long_cont[year == 2005 & scenario == "Historical", .(year, pr)]
+rcp_scenarios <- c("RCP 4.5", "RCP 8.5")
+for(s in rcp_scenarios){
+  pr_long_cont <- rbind(
+    pr_long_cont,
+    data.table(year = 2005, scenario = s, pr = historical_2005$pr)
+  )
+}
+
+# Ensure unique rows and order
+pr_long_cont <- unique(pr_long_cont)
+setorder(pr_long_cont, scenario, year)
+
+# Plot
+pr = ggplot(pr_long_cont, aes(x = year, y = pr, color = scenario, fill = scenario, group = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(
+    data = pr_long_cont[scenario %in% c("RCP 4.5", "RCP 8.5")],
+    aes(ymin = pr - sd(pr, na.rm = TRUE), ymax = pr + sd(pr, na.rm = TRUE), fill = scenario),
+    alpha = 0.25, color = NA
+  ) +
+  geom_vline(xintercept = 2005, linetype = "dashed", color = "black", linewidth = 1) +
+  scale_x_continuous(breaks = seq(1990, 2045, by = 5), limits = c(1990, 2045), expand = c(0, 0)) +
+  scale_color_manual(values = c("Historical" = "black", "RCP 4.5" = "#1E90FF", "RCP 8.5" = "#FF4500")) +
+  scale_fill_manual(values = c("Historical" = "transparent", "RCP 4.5" = "#1E90FF", "RCP 8.5" = "#FF4500")) +
+  labs(
+    title = "Mean July–August Precipitation (mm)",
+    x = "Year",
+    y = "Pr. (mm)",
+    color = "Scenario",
+    fill = "Scenario"
+  )+
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(size = 9, color = "black", face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black",angle = 45, hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", size = 9,face = "bold"),
+    axis.text.y = element_text(color =  "black", face = "bold"),
+    #legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"),
+  )
+
+# --- Step 1: Filter July–August ---
+tasmax_data <- combined[month %in% c(7, 8)]
+
+# --- Step 2: Compute mean tasmax for each year and scenario ---
+tasmax_mean <- tasmax_data[, .(
+  tasmax_historical = mean(tasmax_historical, na.rm = TRUE),
+  tasmax_rcp45 = mean(tasmax_rcp45, na.rm = TRUE),
+  tasmax_rcp85 = mean(tasmax_rcp85, na.rm = TRUE)
+), by = year]
+
+# --- Step 3: Convert from Kelvin to Celsius ---
+tasmax_mean[, `:=`(
+  tasmax_historical = tasmax_historical - 273.15,
+  tasmax_rcp45 = tasmax_rcp45 - 273.15,
+  tasmax_rcp85 = tasmax_rcp85 - 273.15
+)]
+
+# --- Step 4: Convert to long format ---
+tasmax_long <- melt(
+  tasmax_mean,
+  id.vars = "year",
+  variable.name = "scenario",
+  value.name = "tasmax"
+)
+
+# --- Step 5: Clean scenario labels for legend ---
+tasmax_long[, scenario := fcase(
+  scenario == "tasmax_historical", "Historical",
+  scenario == "tasmax_rcp45", "RCP 4.5",
+  scenario == "tasmax_rcp85", "RCP 8.5"
+)]
+
+# --- Step 6: Drop NAs and prepare continuous data ---
+tasmax_long_clean <- na.omit(tasmax_long)
+tasmax_long_cont <- copy(tasmax_long_clean)
+
+# Ensure factor order
+tasmax_long_cont[, scenario := factor(trimws(scenario),
+                                      levels = c("Historical", "RCP 4.5", "RCP 8.5"))]
+
+# Fill missing 2005 rows for connecting lines
+historical_2005 <- tasmax_long_cont[year == 2005 & scenario == "Historical", .(year, tasmax)]
+rcp_scenarios <- c("RCP 4.5", "RCP 8.5")
+for (s in rcp_scenarios) {
+  tasmax_long_cont <- rbind(
+    tasmax_long_cont,
+    data.table(year = 2005, scenario = s, tasmax = historical_2005$tasmax)
+  )
+}
+
+# Ensure unique rows and order
+tasmax_long_cont <- unique(tasmax_long_cont)
+setorder(tasmax_long_cont, scenario, year)
+
+# --- Step 7: Plot ---
+ggplot(tasmax_long_cont, aes(x = year, y = tasmax, color = scenario, fill = scenario, group = scenario)) +
+  geom_line(linewidth = 1.3) +
+  geom_ribbon(
+    data = tasmax_long_cont[scenario %in% c("RCP 4.5", "RCP 8.5")],
+    aes(ymin = tasmax - sd(tasmax, na.rm = TRUE),
+        ymax = tasmax + sd(tasmax, na.rm = TRUE),
+        fill = scenario),
+    alpha = 0.25, color = NA
+  ) +
+  geom_vline(xintercept = 2005, linetype = "dashed", color = "black", linewidth = 1) +
+  scale_x_continuous(breaks = seq(1990, 2045, by = 5),
+                     limits = c(1990, 2045),
+                     expand = c(0, 0)) +
+  scale_color_manual(values = c(
+    "Historical" = "black",
+    "RCP 4.5" = "#1E90FF",
+    "RCP 8.5" = "#FF4500"
+  )) +
+  scale_fill_manual(values = c(
+    "Historical" = "transparent",
+    "RCP 4.5" = "#1E90FF",
+    "RCP 8.5" = "#FF4500"
+  )) +
+  labs(
+    title = "Mean July–August Maximum Temperature (Tasmax)",
+    subtitle = "Historical vs. Future Climate Scenarios",
+    x = "Year",
+    y = "Temperature (°C)",
+    color = "Scenario",
+    fill = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold")
+  )
+
+# --- Step 1: Filter July–August ---
+tasmin_data <- combined[month %in% c(7, 8)]
+
+# --- Step 2: Compute mean tasmin for each year and scenario ---
+tasmin_mean <- tasmin_data[, .(
+  tasmin_historical = mean(tasmin_historical, na.rm = TRUE),
+  tasmin_rcp45 = mean(tasmin_rcp45, na.rm = TRUE),
+  tasmin_rcp85 = mean(tasmin_rcp85, na.rm = TRUE)
+), by = year]
+
+# --- Step 3: Convert from Kelvin to Celsius ---
+tasmin_mean[, `:=`(
+  tasmin_historical = tasmin_historical - 273.15,
+  tasmin_rcp45 = tasmin_rcp45 - 273.15,
+  tasmin_rcp85 = tasmin_rcp85 - 273.15
+)]
+
+# --- Step 4: Convert to long format ---
+tasmin_long <- melt(
+  tasmin_mean,
+  id.vars = "year",
+  variable.name = "scenario",
+  value.name = "tasmin"
+)
+
+# --- Step 5: Clean scenario labels for legend ---
+tasmin_long[, scenario := fcase(
+  scenario == "tasmin_historical", "Historical",
+  scenario == "tasmin_rcp45", "RCP 4.5",
+  scenario == "tasmin_rcp85", "RCP 8.5"
+)]
+
+# --- Step 6: Drop NAs and prepare continuous data ---
+tasmin_long_clean <- na.omit(tasmin_long)
+tasmin_long_cont <- copy(tasmin_long_clean)
+
+# Ensure factor order
+tasmin_long_cont[, scenario := factor(trimws(scenario),
+                                      levels = c("Historical", "RCP 4.5", "RCP 8.5"))]
+
+# Fill missing 2005 rows for connecting lines
+historical_2005 <- tasmin_long_cont[year == 2005 & scenario == "Historical", .(year, tasmin)]
+rcp_scenarios <- c("RCP 4.5", "RCP 8.5")
+for (s in rcp_scenarios) {
+  tasmin_long_cont <- rbind(
+    tasmin_long_cont,
+    data.table(year = 2005, scenario = s, tasmin = historical_2005$tasmin)
+  )
+}
+
+# Ensure unique rows and order
+tasmin_long_cont <- unique(tasmin_long_cont)
+setorder(tasmin_long_cont, scenario, year)
+
+# --- Step 7: Plot ---
+ggplot(tasmin_long_cont, aes(x = year, y = tasmin, color = scenario, fill = scenario, group = scenario)) +
+  geom_line(linewidth = 1.3) +
+  geom_ribbon(
+    data = tasmin_long_cont[scenario %in% c("RCP 4.5", "RCP 8.5")],
+    aes(ymin = tasmin - sd(tasmin, na.rm = TRUE),
+        ymax = tasmin + sd(tasmin, na.rm = TRUE),
+        fill = scenario),
+    alpha = 0.25, color = NA
+  ) +
+  geom_vline(xintercept = 2005, linetype = "dashed", color = "black", linewidth = 1) +
+  scale_x_continuous(breaks = seq(1990, 2045, by = 5),
+                     limits = c(1990, 2045),
+                     expand = c(0, 0)) +
+  scale_color_manual(values = c(
+    "Historical" = "black",
+    "RCP 4.5" = "#1E90FF",
+    "RCP 8.5" = "#FF4500"
+  )) +
+  scale_fill_manual(values = c(
+    "Historical" = "transparent",
+    "RCP 4.5" = "#1E90FF",
+    "RCP 8.5" = "#FF4500"
+  )) +
+  labs(
+    title = "Mean July–August Minimum Temperature (Tasmin)",
+    subtitle = "Historical vs. Future Climate Scenarios",
+    x = "Year",
+    y = "Temperature (°C)",
+    color = "Scenario",
+    fill = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold")
+  )
+library(ranger)
+library(pdp)
+library(ggpubr)
+
+# Filter only July
+july_data <- combined[month == 7]
+
+# Scenario list
+scenarios <- c("historical", "rcp45", "rcp85")
+rf_results <- list()
+
+# Use smaller sample to avoid computation issues
+sample_size <- 5000
+set.seed(123)
+
+for(sc in scenarios){
+  
+  # Prepare data for each scenario
+  if(sc == "historical"){
+    dat <- july_data[, .(pr = pr_historical, tasmax = tasmax_historical, tasmin = tasmin_historical)]
+  } else if(sc == "rcp45"){
+    dat <- july_data[, .(pr = pr_rcp45, tasmax = tasmax_rcp45, tasmin = tasmin_rcp45)]
+  } else {
+    dat <- july_data[, .(pr = pr_rcp85, tasmax = tasmax_rcp85, tasmin = tasmin_rcp85)]
+  }
+  
+  # Remove NA
+  dat <- na.omit(dat)
+  
+  # Sample to reduce computation
+  if(nrow(dat) > sample_size) dat <- dat[sample(.N, sample_size)]
+  
+  # Convert temperatures from Kelvin to Celsius
+  dat[, tasmax := tasmax - 273.15]
+  dat[, tasmin := tasmin - 273.15]
+  
+  # Convert to data.frame for ranger
+  dat_df <- as.data.frame(dat)
+  
+  # Fit Random Forest
+  rf_model <- ranger(pr ~ tasmax + tasmin,
+                     data = dat_df,
+                     num.trees = 100,
+                     num.threads = 1,
+                     verbose = TRUE)
+  
+  # Partial dependence
+  pd_tmax <- partial(rf_model, pred.var = "tasmax", train = dat_df)
+  pd_tmin <- partial(rf_model, pred.var = "tasmin", train = dat_df)
+  
+  # Add scenario column
+  pd_tmax$scenario <- sc
+  pd_tmin$scenario <- sc
+  
+  rf_results[[paste0(sc, "_tmax")]] <- pd_tmax
+  rf_results[[paste0(sc, "_tmin")]] <- pd_tmin
+}
+
+# Combine all partial dependence data
+pdp_tmax_all <- rbindlist(rf_results[grep("_tmax", names(rf_results))])
+pdp_tmin_all <- rbindlist(rf_results[grep("_tmin", names(rf_results))])
+
+# Map scenario labels
+pdp_tmax_all[, scenario := factor(scenario, levels = scenarios, 
+                                  labels = c("Historical", "RCP 4.5", "RCP 8.5"))]
+pdp_tmin_all[, scenario := factor(scenario, levels = scenarios, 
+                                  labels = c("Historical", "RCP 4.5", "RCP 8.5"))]
+
+# Plot Partial Dependence
+p1 <- ggplot(pdp_tmax_all, aes(x = tasmax, y = yhat, color = scenario)) +
+  geom_line(linewidth = 1.2) +
+  labs(title = "Effect of Tmax on July Precipitation", x = "Tmax (°C)", y = "Predicted Pr. (mm)") +
+  scale_color_manual(values = c("black", "#1E90FF", "#FF4500")) +
+  theme_minimal() +
+  theme(
+    #legend.position = "top",
+    plot.title = element_text(size = 9, color = "black",face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", size = 9,face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold"),
+    legend.position = c(0.95, 0.95),
+    legend.justification = c("right", "top"),
+  )
+
+p2 <- ggplot(pdp_tmin_all, aes(x = tasmin, y = yhat, color = scenario)) +
+  geom_line(linewidth = 1.2) +
+  labs(title = "Effect of Tmin on July Precipitation", x = "Tmin (°C)", y = "Predicted Pr. (mm)") +
+  scale_color_manual(values = c("black", "#1E90FF", "#FF4500")) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 9, color = "black",face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", size = 9,face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold")
+  )
+
+# Combine plots
+ggarrange(p1/ p2)
+
+combined_plot <- plot_grid(
+  p, pr/p1/p2,
+  ncol = 2, rel_widths = c(1, .49),
+  align = "h", axis = "tblr"
+)
+
+ggsave(
+  filename = "MACA.jpeg",
+  plot = combined_plot,
+  width = 15, height = 7, dpi = 300
+)
