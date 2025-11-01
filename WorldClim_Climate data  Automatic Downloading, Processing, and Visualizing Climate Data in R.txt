@@ -1,0 +1,416 @@
+# ============================================================
+# WORLDCLIM V2.1 CLIMATE DATA DOWNLOAD SCRIPT
+# Historical (1970–2000) + Future (2021–2100, CMIP6)
+# Variables: Tmin, Tmax, Precipitation
+# Model: GFDL-ESM4 | Resolution: 5 arc-min (~10 km)
+# Author: Ali Hassan Shabbir
+# ============================================================
+
+library(terra)
+library(curl)
+
+# ============================================================
+# HISTORICAL DATA (1970–2000)
+# ============================================================
+
+hist_vars <- c("tmin", "tmax", "prec")
+hist_base <- "https://geodata.ucdavis.edu/climate/worldclim/2_1/base"
+
+dir.create("historical_data", showWarnings = FALSE)
+
+for (v in hist_vars) {
+  url <- sprintf("%s/wc2.1_5m_%s.zip", hist_base, v)
+  dest <- basename(url)
+  
+  message("📥 Downloading historical: ", v)
+  
+  success <- FALSE
+  attempts <- 0
+  
+  while (!success && attempts < 5) {
+    attempts <- attempts + 1
+    tryCatch({
+      h <- new_handle(timeout = 300)
+      curl_download(url, destfile = dest, handle = h)
+      unzip(dest, exdir = "historical_data")
+      success <- TRUE
+      message("✅ Successfully downloaded: ", v)
+    }, error = function(e) {
+      message("⚠️ Failed (attempt ", attempts, "): ", conditionMessage(e))
+      Sys.sleep(5)
+    })
+  }
+  if (!success) warning("❌ Skipped ", v, " after 5 failed attempts.")
+}
+
+# ============================================================
+# FUTURE DATA (2021–2100) – MIROC6
+# ============================================================
+
+dir.create("future_data", showWarnings = FALSE)
+
+future_vars <- c("tmin", "tmax", "prec")
+ssps <- c("ssp245", "ssp585")
+periods <- c("2021-2040", "2041-2060")
+model <- "MIROC6"
+base_future <- "https://geodata.ucdavis.edu/cmip6/5m"
+
+for (v in future_vars) {
+  for (s in ssps) {
+    for (p in periods) {
+      url <- sprintf("%s/%s/%s/wc2.1_5m_%s_%s_%s_%s.tif",
+                     base_future, model, s, v, model, s, p)
+      dest <- file.path("future_data", basename(url))
+      
+      message("📥 Downloading future: ", v, " | ", s, " | ", p)
+      
+      tryCatch({
+        h <- new_handle(timeout = 300)
+        curl_download(url, destfile = dest, handle = h)
+        message("✅ Done: ", basename(dest))
+      }, error = function(e) {
+        message("❌ Failed: ", conditionMessage(e))
+      })
+    }
+  }
+}
+
+library(terra)
+library(data.table)
+library(sf)
+library(dplyr)
+
+# Read shapefile for Missouri
+usa <- st_read("gadm41_USA_2.shp")
+shp <- usa %>% filter(NAME_1 == "Missouri") %>% st_transform(4326)
+
+# List all tif files
+tif_files <- list.files(pattern = "\\.tif$", full.names = TRUE)
+
+# Function to rename layers inside a raster
+rename_layers <- function(r, period) {
+  n <- nlyr(r)
+  names(r) <- paste0(period, "-", sprintf("%02d", 1:n))
+  return(r)
+}
+
+# Function to process any variable
+process_variable <- function(varname, shapefile) {
+  
+  files <- tif_files[grepl(varname, tif_files)]
+  
+  # Separate historical and scenarios
+  hist_files <- files[grepl("_[0-9]{2}\\.tif$", files)]
+  ssp245_files <- files[grepl("ssp245", files)]
+  ssp585_files <- files[grepl("ssp585", files)]
+  
+  # Historical
+  hist_rast <- rast(hist_files)
+  hist_rast <- crop(hist_rast, shapefile) |> mask(shapefile)
+  hist_rast <- rename_layers(hist_rast, "1970-2000")
+  hist_df <- as.data.table(as.data.frame(hist_rast, xy = TRUE))
+  hist_df <- melt(hist_df, id.vars = c("x","y"), variable.name = "date", value.name = varname)
+  hist_df[, scenario := "historical"]
+  
+  # SSP245
+  ssp245_rast <- NULL
+  for (f in ssp245_files) {
+    r <- rast(f)
+    r <- crop(r, shapefile) |> mask(shapefile)
+    period <- gsub(".*_(\\d{4}-\\d{4})\\.tif$", "\\1", basename(f))
+    r <- rename_layers(r, period)
+    if (is.null(ssp245_rast)) ssp245_rast <- r else ssp245_rast <- c(ssp245_rast, r)
+  }
+  ssp245_df <- as.data.table(as.data.frame(ssp245_rast, xy = TRUE))
+  ssp245_df <- melt(ssp245_df, id.vars = c("x","y"), variable.name = "date", value.name = varname)
+  ssp245_df[, scenario := "ssp245"]
+  
+  # SSP585
+  ssp585_rast <- NULL
+  for (f in ssp585_files) {
+    r <- rast(f)
+    r <- crop(r, shapefile) |> mask(shapefile)
+    period <- gsub(".*_(\\d{4}-\\d{4})\\.tif$", "\\1", basename(f))
+    r <- rename_layers(r, period)
+    if (is.null(ssp585_rast)) ssp585_rast <- r else ssp585_rast <- c(ssp585_rast, r)
+  }
+  ssp585_df <- as.data.table(as.data.frame(ssp585_rast, xy = TRUE))
+  ssp585_df <- melt(ssp585_df, id.vars = c("x","y"), variable.name = "date", value.name = varname)
+  ssp585_df[, scenario := "ssp585"]
+  
+  # Combine all
+  all_df <- rbindlist(list(hist_df, ssp245_df, ssp585_df), fill = TRUE)
+  return(all_df)
+}
+
+# Process each variable
+tmin_df <- process_variable("tmin", shp)
+tmax_df <- process_variable("tmax", shp)
+prec_df <- process_variable("prec", shp)
+
+# Merge into one tidy table
+climate_df <- Reduce(function(x, y) merge(x, y, by = c("x","y","scenario","date"), all = TRUE),
+                     list(tmin_df, tmax_df, prec_df))
+
+# Split the 'date' column into 'period' and 'month'
+climate_df[, c("period", "month") := {
+  parts <- tstrsplit(as.character(date), "-", fixed = TRUE)  # splits into 3 parts
+  list(
+    paste(parts[[1]], parts[[2]], sep = "-"),  # period: "1970-2000"
+    parts[[3]]                                # month: "01", "02", ...
+  )
+}]
+
+# Optional: remove old 'date' column
+climate_df[, date := NULL]
+
+# Reorder columns
+setcolorder(climate_df, c("x","y","scenario","period","month","tmin","tmax","prec"))
+
+library(ggplot2)
+library(viridis)
+library(sf)
+library(data.table)
+library(RColorBrewer)
+library(scales)
+library(ggspatial)
+library(ggExtra)
+library(viridis)
+library(ggside)
+library(cowplot)
+library(patchwork)
+# Convert your shapefile to sf (Missouri already read as `shp`)
+
+# Filter for Aug-Nov months
+months <- c("08","09","10","11")
+climate_months <- climate_df[month %in% months]
+
+# Optional: convert month numbers to names
+climate_months[, month_name := factor(month, 
+                                      levels = c("08","09","10","11"),
+                                      labels = c("August","September","October","November"))]
+vmin <- min(climate_months$prec)
+vmax <- max(climate_months$prec)
+
+breaks <- classInt::classIntervals(
+  climate_months$prec, n = 18, style = "pretty"
+)$brks
+# Combine multiple palettes for a smooth gradient
+pal1 <- brewer.pal(9, "YlGnBu")
+pal2 <- brewer.pal(9, "Spectral")
+pal3 <- brewer.pal(9, "BrBG")
+pal4 <- brewer.pal(9, "RdYlGn")
+
+cols <- colorRampPalette(c(pal1, pal2, pal3, pal4))
+#colors <- c("#EE82EE", "#8A2BE2", "#00FFFF", "#00FF00", "#FFFF00", "#FF0000")
+colors = c("#fbbefd", "#cd04cb", "#9400d0", "#820026", "#bc0025", "#e2171e", "#fab53b", "#fad41a", "#f6ff0a", "#75c878",
+           "#1d873e","#00693a", "#21368a", "#0153a1", "#1c73b1", "#3c91cb","#3c91cb", "#c4daf1", "#deeaf5", "#f2f8ff")
+
+colors = c( "#f2f8ff","#c4daf1", "#deeaf5","#3c91cb","#21368a", "#0153a1", "#1c73b1", "#3c91cb","#fbbefd", "#cd04cb", "#9400d0", 
+            "#fab53b", "#fad41a", "#f6ff0a", "#75c878","#1d873e","#00693a","#820026", "#bc0025", "#e2171e")
+
+# Plot: separate map for each month
+map = ggplot(climate_months) +
+  geom_raster(aes(x = x, y = y, fill = prec)) +
+  geom_sf(data = shp, fill = NA, color = "black", size = 0.5) +
+  facet_grid(scenario ~ month_name) +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = 1)
+  )+
+  coord_sf() +
+  labs(fill = "Precipitation (mm)") +
+  # Reduce number of longitude (x) and latitude (y) breaks
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Precipitation (Aug-Nov) by Scenario in Missouri",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: WorldClim version 2.1"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 16),
+    plot.title  = element_text(hjust = 0, size = 16, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 16),
+    axis.title  = element_text(color = "black", size = 16, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(2.2, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 16, face = "bold", color = "black"),
+    legend.text  = element_text(size = 16, color = "black")
+  )
+
+# Filter for November only
+nov_df <- climate_df[month == "11"]
+
+# Keep all grid cells (no averaging here!)
+# Make sure 'period' is a factor for correct x-axis order
+nov_df[, period := factor(period, levels = c("1970-2000", "2021-2040", "2041-2060"))]
+
+# Now make the boxplot
+ggplot(nov_df, aes(x = period, y = prec, fill = scenario)) +
+  geom_boxplot(outlier.color = "grey40", outlier.size = 0.8,
+               position = position_dodge(width = 0.8)) +
+  scale_fill_viridis_d(option = "C", begin = 0.2, end = 0.9) +
+  labs(
+    title = "November Precipitation Distribution (1970–2060)",
+    x = "Period",
+    y = "Precipitation (mm)",
+    fill = "Scenario"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+nov_df <- climate_df[month == "11"]
+nov_df[, period_num := as.numeric(factor(period, 
+                                         levels = c("1970-2000", "2021-2040", "2041-2060")))]
+
+p <- ggplot(nov_df, aes(x = period_num, y = prec, color = scenario)) +
+  geom_jitter(alpha = 0.5, width = 0.1, size = 1) +
+  scale_color_viridis_d(option = "C", begin = 0.2, end = 0.9) +
+  scale_x_continuous(
+    breaks = c(1, 2, 3),
+    labels = c("1970–2000", "2021–2040", "2041–2060")
+  ) +
+  labs(
+    title = "November Precipitation Distribution (1970–2060)",
+    x = "Period", y = "Precipitation (mm)",
+    color = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(
+    #legend.position = "top",
+    plot.title = element_text(size = 16, color = "black",face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", hjust = 1,size = 14, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", size = 14,face = "bold"),
+    axis.text.y = element_text(color = "black",size = 14, face = "bold"),
+    legend.position = c(0.85, 0.85),
+    legend.justification = c("right", "top"),
+    legend.title = element_text(size = 12, face = "bold", color = "black"),
+    legend.text  = element_text(size = 12, color = "black")
+  )
+
+p1 = ggMarginal(p, type = "densigram", fill = "#e2171e", alpha = 0.7)
+# nov_df already has period_num
+
+
+
+# Filter November data
+nov_df <- climate_df[month == "11"]
+
+# Take mean by grid cell, period, and scenario
+nov_mean <- nov_df[, .(
+  tmax = mean(tmax, na.rm = TRUE),
+  prec = mean(prec, na.rm = TRUE)
+), by = .(x, y, scenario, period)]
+
+# Ensure proper ordering
+nov_mean[, period := factor(period, levels = c("1970-2000", "2021-2040", "2041-2060"))]
+nov_mean[, scenario := factor(scenario, levels = c("historical", "ssp245", "ssp585"))]
+
+p2 = ggplot(nov_mean, aes(x = tmax, y = prec, color = scenario)) +
+  geom_point(alpha = 0.5, size = 1.6) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", size = 1) +
+  geom_xsidedensity(aes(y = ..density.., fill = scenario), alpha = 0.3, position = "identity") +
+  geom_ysidedensity(aes(x = ..density.., fill = scenario), alpha = 0.3, position = "identity") +
+  scale_color_viridis_d(option = "C", begin = 0.2, end = 0.9) +
+  scale_fill_viridis_d(option = "C", begin = 0.2, end = 0.9) +
+  labs(
+    title = "Effect of Tmax on Precipitation (November Mean)",
+    x = "Mean Tmax (°C)",
+    y = "Mean Precipitation (mm)",
+    color = "Scenario",
+    fill = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(
+    #legend.position = "top",
+    plot.title = element_text(size = 16, color = "black",face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", angle = 45,size = 14, hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", size = 14,face = "bold"),
+    axis.text.y = element_text(color = "black", size = 14, face = "bold"),
+    legend.position = c(0.35, 0.85),
+    legend.justification = c("right", "top"),
+    legend.title = element_text(size = 12, face = "bold", color = "black"),
+    legend.text  = element_text(size = 12, color = "black")
+  )
+
+# Filter November data
+nov_df <- climate_df[month == "11"]
+
+# Take mean by grid cell, period, and scenario
+nov_mean <- nov_df[, .(
+  tmin = mean(tmin, na.rm = TRUE),
+  prec = mean(prec, na.rm = TRUE)
+), by = .(x, y, scenario, period)]
+
+# Ensure proper ordering
+nov_mean[, period := factor(period, levels = c("1970-2000", "2021-2040", "2041-2060"))]
+nov_mean[, scenario := factor(scenario, levels = c("historical", "ssp245", "ssp585"))]
+
+p3 = ggplot(nov_mean, aes(x = tmin, y = prec, color = scenario)) +
+  geom_point(alpha = 0.5, size = 1.6) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", size = 1) +
+  geom_xsidedensity(aes(y = ..density.., fill = scenario), alpha = 0.3, position = "identity") +
+  geom_ysidedensity(aes(x = ..density.., fill = scenario), alpha = 0.3, position = "identity") +
+  scale_color_viridis_d(option = "C", begin = 0.2, end = 0.9) +
+  scale_fill_viridis_d(option = "C", begin = 0.2, end = 0.9) +
+  labs(
+    title = "Effect of Tmin on Precipitation (November Mean)",
+    x = "Mean Tmin (°C)",
+    y = "Mean Precipitation (mm)",
+    color = "Scenario",
+    fill = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(
+    #legend.position = "top",
+    plot.title = element_text(size = 16, color = "black",face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    axis.text.x = element_text(color = "black", angle = 45,  size = 12,hjust = 1, face = "bold"),
+    axis.ticks = element_line(size = 0.1, color = "black"),
+    axis.title = element_text(color = "black", size = 14,face = "bold"),
+    axis.text.y = element_text(color = "black",  size = 12,face = "bold"),
+    legend.position = c(0.20, 0.85),
+    legend.justification = c("right", "top"),
+    legend.title = element_text(size = 12, face = "bold", color = "black"),
+    legend.text  = element_text(size = 12, color = "black")
+  )
+
+
+right_stack <- plot_grid(p1, p2, p3, ncol = 1, align = "v")
+combined_plot <- plot_grid(map, right_stack, ncol = 2, rel_widths = c(1, 0.49), align = "h")
+
+
+ggsave(
+  filename = "WorldClim.jpeg",
+  plot = combined_plot,
+  width = 29, height = 13, dpi = 300
+)
+
+
+
+
