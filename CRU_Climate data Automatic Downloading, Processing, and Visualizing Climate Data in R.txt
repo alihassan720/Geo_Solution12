@@ -1,0 +1,401 @@
+library(curl)
+library(R.utils)
+# Timeout option
+options(timeout = 1200)  # 20 minutes for safety
+
+# URLs of CRU TS files
+files <- list(
+  tmx = "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.09/cruts.2503051245.v4.09/tmx/cru_ts4.09.1901.2024.tmx.dat.nc.gz",
+  tmn = "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.09/cruts.2503051245.v4.09/tmn/cru_ts4.09.1901.2024.tmn.dat.nc.gz",
+  pre = "https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.09/cruts.2503051245.v4.09/pre/cru_ts4.09.1901.2024.pre.dat.nc.gz"
+)
+
+# Loop to download all files
+for (var in names(files)) {
+  url <- files[[var]]
+  destfile <- paste0("cru_", var, "_1901_2024.nc.gz")
+  
+  cat("\nDownloading", var, "...\n")
+  h <- new_handle()
+  handle_setopt(h, timeout = 1200)  # 20 minutes
+  curl_download(url, destfile, handle = h)
+  
+  cat(var, "download completed!\n")
+}
+
+
+CRU_files <- list.files(pattern = "\\.gz$", full.names = TRUE)
+# Extract each file (keeping original .gz)
+for (file in CRU_files) {
+  cat("Extracting:", file, "\n")
+  R.utils::gunzip(file, remove = FALSE, overwrite = TRUE)
+}
+
+cat("✅ All .gz files successfully extracted to .nc format!\n")
+
+CRU_nc_files <- list.files(pattern = "\\.nc$", full.names = TRUE)
+# ============================================================
+# CRU TS v4.09 (1901–2024)
+# Crop, Mask, and Extract Monthly Data (Missouri)
+# Variables: pre, tmn, tmx
+# Author: Ali Hassan Shabbir
+# ============================================================
+# Load Required Libraries
+# -----------------------------
+library(terra)        # raster data handling
+library(sf)           # vector spatial data
+library(dplyr)        # data manipulation
+library(tidyr)        # data reshaping
+library(data.table)   # fast table operations
+library(ggplot2)      # plotting
+library(lubridate)    # date handling
+library(SPEI)         # drought indices (SPI, SPEI)
+library(classInt)     # for class intervals in color scales
+library(scales)       # for formatting labels
+library(cowplot)      # for combining plots
+library(ggspatial)    # for north arrow and scale bar
+# 1. Load shapefile
+usa <- st_read("gadm41_USA_2.shp", quiet = TRUE)
+shp <- usa %>% filter(NAME_1 == "Missouri") %>% st_transform(4326)
+shp_vect <- vect(shp)
+
+# 2. Load CRU rasters
+pre_r <- rast("cru_pre_1901_2024.nc", subds = "pre")
+tmn_r <- rast("cru_tmn_1901_2024.nc", subds = "tmn")
+tmx_r <- rast("cru_tmx_1901_2024.nc", subds = "tmx")
+
+# 3. Crop and mask rasters
+pre_crop <- crop(pre_r, shp_vect) %>% mask(shp_vect)
+tmn_crop <- crop(tmn_r, shp_vect) %>% mask(shp_vect)
+tmx_crop <- crop(tmx_r, shp_vect) %>% mask(shp_vect)
+
+# 4. Combine rasters into a single SpatRaster
+combined <- c(pre_crop, tmn_crop, tmx_crop)
+names(combined) <- paste0(rep(c("pre", "tmn", "tmx"), each = nlyr(pre_crop)), "_", 1:nlyr(pre_crop))
+
+# 5. Convert to data.frame in chunks (per layer)
+dates <- time(pre_crop)
+final_list <- list()
+
+for (i in 1:nlyr(pre_crop)) {
+  df <- as.data.frame(combined[[c(i, i + nlyr(pre_crop), i + 2*nlyr(pre_crop))]], xy = TRUE, na.rm = FALSE)
+  colnames(df) <- c("x", "y", "pre", "tmn", "tmx")
+  df$date <- dates[i]
+  final_list[[i]] <- df
+  if(i %% 50 == 0) cat("Processed", i, "of", nlyr(pre_crop), "layers\n")
+}
+
+# 6. Bind all layers into one data.frame
+final_df <- bind_rows(final_list)
+
+dt <- as.data.table(final_df)
+
+na_percent <- dt[, .(
+  pre_NA_pct = 100 * sum(is.na(pre)) / .N,
+  tmn_NA_pct = 100 * sum(is.na(tmn)) / .N,
+  tmx_NA_pct = 100 * sum(is.na(tmx)) / .N
+)]
+
+na_percent
+dt_long <- dt[!(is.na(pre) & is.na(tmn) & is.na(tmx))]
+
+dt_long[, year := year(date)]
+dt_long[, month := month(date)]
+dt_long[, day := day(date)]
+
+# ensure data.table
+setDT(dt_long)
+
+# monthly mean (average of all days for each grid cell per month & year)
+dt_monthly <- dt_long[, .(
+  pre = mean(pre, na.rm = TRUE)
+), by = .(x, y, year, month)]
+dt_clim <- dt_monthly[, .(
+  pre = mean(pre, na.rm = TRUE)
+), by = .(x, y, month)]
+dt_clim$month_name <- factor(
+  month.abb[dt_clim$month],   # or month.name for full names
+  levels = month.abb          # keeps the order Jan → Dec
+)
+vmin <- min(dt_clim$pre)
+vmax <- max(dt_clim$pre)
+
+breaks <- classInt::classIntervals(
+  dt_clim$pre, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#deeaf5","#3c91cb","#21368a", "#0153a1", "#1c73b1", "#3c91cb","#fbbefd", "#cd04cb", "#9400d0", 
+            "#fab53b", "#fad41a", "#f6ff0a", "#75c878","#1d873e","#00693a","#820026", "#bc0025", "#e2171e")
+ggplot(dt_clim, aes(x = x, y = y, fill = pre)) +
+  geom_tile() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = 1)
+  )+
+  coord_sf()+
+  facet_wrap(~ month_name, ncol = 4) +
+  theme_minimal()+
+  labs(fill = "Precipitation (mm)") +
+  # Reduce number of longitude (x) and latitude (y) breaks
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Mean Precipitation (1901–2024) in Missouri",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: CRU"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(2.2, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+#Step 1: Compute PET and SPEI (Agricultural Drought)
+#We can use Hargreaves PET:
+# Compute mean temperature
+dt_long <- dt_long %>%
+  mutate(tmean = (tmx + tmn)/2)
+
+# Monthly aggregation per pixel
+dt_monthly <- dt_long %>%
+  group_by(x, y, year, month) %>%
+  summarise(
+    pre   = sum(pre, na.rm = TRUE),
+    tmean = mean(tmean, na.rm = TRUE),
+    temp_diff = mean(tmx - tmn, na.rm = TRUE)  # compute Tmax-Tmin difference
+  ) %>%
+  ungroup()
+
+# Hargreaves PET
+dt_monthly <- dt_monthly %>%
+  mutate(
+    temp_diff = pmax(temp_diff, 0.1),  # avoid zero/negative sqrt
+    pet = 0.0023 * (tmean + 17.8) * sqrt(temp_diff) * pre
+  ) %>%
+  select(-temp_diff)
+#Step 2: Compute SPI (meteorological drought) and SPEI (agricultural drought)
+# Example: 3-month SPI per pixel
+compute_spi_spei <- function(pre_vec, pet_vec=NULL, scale=3){
+  if(is.null(pet_vec)){
+    # SPI
+    spi <- spi(pre_vec, scale = scale)$fitted
+    return(spi)
+  } else{
+    # SPEI
+    spei_val <- spei(pre_vec - pet_vec, scale = scale)$fitted
+    return(spei_val)
+  }
+}
+
+# Apply per pixel
+
+dt_monthly_dt <- as.data.table(dt_monthly)
+
+dt_monthly_dt[, spi3 := compute_spi_spei(pre), by=.(x,y)]
+dt_monthly_dt[, spei3 := compute_spi_spei(pre, pet), by=.(x,y)]
+
+#Hydrological drought: can be approximated as SPI or SPEI at longer timescales, e.g., 12 or 24 months.
+
+dt_monthly_dt[, spi12 := compute_spi_spei(pre, scale=12), by=.(x,y)]
+
+# Convert to data.table
+dt <- as.data.table(dt_monthly_dt)
+
+# Aggregate by month (across years) per pixel
+dt_monthly_mean <- dt[, .(
+  spi3_mean  = mean(spi3, na.rm=TRUE),
+  spei3_mean = mean(spei3, na.rm=TRUE),
+  spi12_mean = mean(spi12, na.rm=TRUE)
+), by=.(x, y, month)]
+
+# Convert month number to abbreviated month names
+dt_monthly_mean[, month_name := factor(month.abb[month], levels=month.abb)]
+library(data.table)
+
+# Make sure dt_monthly_mean is a data.table
+dt_monthly_mean_dt <- as.data.table(dt_monthly_mean)
+
+# Melt using data.table::melt
+df_plot <- data.table::melt(
+  dt_monthly_mean_dt,
+  id.vars = c("x", "y", "month_name"),
+  measure.vars = c("spi3_mean", "spei3_mean", "spi12_mean"),
+  variable.name = "Drought_Type",
+  value.name = "value"
+)
+
+# Now assign factor labels with line breaks
+df_plot[, Drought_Type := factor(Drought_Type,
+                                 levels = c("spi3_mean", "spei3_mean", "spi12_mean"),
+                                 labels = c("Meteorological\nDrought (SPI-3)",
+                                            "Agricultural\nDrought (SPEI-3)",
+                                            "Hydrological\nDrought (SPI-12)"))]
+
+# Filter for Aug, Sep, Oct
+df_plot_subset <- df_plot[month_name %in% c("Aug", "Sep", "Oct")]
+
+
+ggplot(df_plot_subset, aes(x=x, y=y, fill=value)) +
+  geom_tile() +
+  geom_sf(data=shp, inherit.aes=FALSE, fill=NA, color="black") +
+  scale_fill_gradient2(low="red", mid="white", high="blue", midpoint=0,
+                       name="Drought Index") +
+  facet_grid(month_name ~ Drought_Type) +   # rows = months, columns = drought type
+  coord_sf() +
+  labs(title="Monthly Mean Drought Indices in Missouri (1901–2024)",
+       x="Longitude", y="Latitude") +
+  theme_minimal() +
+  theme(
+    strip.text.x = element_text(face="bold", size=10),
+    strip.text.y = element_text(face="bold", size=10),
+    axis.text = element_text(size=8),
+    axis.title = element_text(size=10)
+  )
+# Rescale to approximate SPI scale
+df_plot_subset[, value_scaled := value / sd(value, na.rm=TRUE)]  # divide by SD
+df_plot_subset <- df_plot_subset %>%
+  mutate(Drought_Category = case_when(
+    value < -0.006 ~ "Extreme Drought",
+    value < -0.004 ~ "Severe Drought",
+    value < -0.002 ~ "Moderate Drought",
+    value <= 0.002 ~ "Normal",
+    value > 0.002  ~ "Wet"
+  ))
+
+df_plot_subset$Drought_Category <- factor(df_plot_subset$Drought_Category,
+                                          levels=c("Extreme Drought", "Severe Drought", 
+                                                   "Moderate Drought", "Normal", "Wet"))
+p1 = ggplot(df_plot_subset, aes(x=x, y=y, fill=Drought_Category)) +
+  geom_tile() +
+  geom_sf(data=shp, inherit.aes=FALSE, fill=NA, color="black") +
+  facet_grid(month_name ~ Drought_Type) +
+  scale_fill_manual(
+    values = c(
+      "Extreme Drought" = "#800026",
+      "Severe Drought"  = "#BD0026",
+      "Moderate Drought"= "#E31A1C",
+      "Normal"          = "#FFFFCC",
+      "Wet"             = "#1A9850"
+    )
+  ) +
+  coord_sf() +
+  # Reduce number of longitude (x) and latitude (y) breaks
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "Mean Drought Categories (Aug–Oct) in Missouri",
+    fill="Drought Category",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: CRU"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(2.2, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+
+# Filter August–October
+dt_aso <- dt_monthly_dt %>%
+  filter(month %in% c(8, 9, 10))
+
+# Compute mean per year across all pixels
+dt_aso_mean <- dt_aso %>%
+  group_by(year) %>%
+  summarise(
+    SPI3_mean  = mean(spi3, na.rm = TRUE),
+    SPEI3_mean = mean(spei3, na.rm = TRUE),
+    SPI12_mean = mean(spi12, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Prepare data
+df_line <- dt_aso_mean %>%
+  pivot_longer(
+    cols = c(SPI3_mean, SPEI3_mean, SPI12_mean),
+    names_to = "Drought_Type",
+    values_to = "value"
+  ) %>%
+  mutate(
+    sign = ifelse(value >= 0, "pos", "neg")  # positive = wet, negative = dry
+  ) %>% 
+  na.omit()
+
+# Add line breaks for facet titles
+df_line$Drought_Type <- factor(df_line$Drought_Type,
+                               levels = c("SPI3_mean", "SPEI3_mean", "SPI12_mean"),
+                               labels = c("Meteorological\nDrought (SPI-3)",
+                                          "Agricultural\nDrought (SPEI-3)",
+                                          "Hydrological\nDrought (SPI-12)"))
+
+# Plot as bar (like your SPEI example)
+p2 = ggplot(df_line) +
+  geom_bar(aes(x = year, y = value, fill = sign, color = sign),
+           stat = "identity", show.legend = F) +
+  scale_color_manual(values = c("pos" = "darkblue", "neg" = "red")) +
+  scale_fill_manual(values = c("pos" = "darkblue", "neg" = "red")) +
+  scale_x_continuous(breaks = seq(1901, 2024, by = 11),   # Customize x-axis breaks
+                     expand = c(0, 0)) +           # Optional: force axis limits
+  facet_wrap(~ Drought_Type, ncol = 1, scales = "free_y") +
+  theme_bw() +
+  labs(
+    y = "Drought Index",
+    x = "Year",
+    title = "Aug–Oct Mean Drought Indices (1901–2024)\n in Missouri",
+    fill = "Condition",
+    color = "Condition"
+  ) +
+  theme_minimal() + 
+  theme(
+    panel.spacing = unit(0, "pt"), 
+    panel.grid = element_blank(), 
+    panel.border = element_rect(color = "black", linewidth = 0.4, fill = NA),
+    strip.text = element_text(size = 10, face = "bold", color = "black"),
+    plot.title = element_text(hjust = 0, size = 10, color = "black", face = "bold"), 
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1, face = "bold"), 
+    axis.title = element_text(color = "black", size = 9, face = "bold"), 
+    axis.text.y = element_text(face = "bold", color = "black"), 
+    axis.ticks = element_line(size = 0.1, color = "black")
+  )
+
+combined_plot <- plot_grid(p1, p2, ncol = 2, rel_widths = c(3, 0.85), align = "h", axis = "tb")
+
+# -----------------------------
+# Save Combined Plot
+# -----------------------------
+ggsave(filename = "CRU.jpeg",
+       plot = combined_plot, width = 16, height = 10, dpi = 300)
