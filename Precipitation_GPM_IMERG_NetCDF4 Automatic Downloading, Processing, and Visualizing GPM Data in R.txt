@@ -1,0 +1,304 @@
+library(fs)
+library(glue)
+library(here)
+library(httr)
+library(purrr)
+library(stringr)
+library(progress)
+
+# Get file URLs ----
+
+urls <- readLines("subset_GPM_3IMERGM_07_20251114_145101_.txt", warn = FALSE)
+
+# Initial setup ----
+
+# >> Create directory for downloaded files
+
+dir_create(path = here("downloaded_files"))
+
+# >> Create ".netrc" file to store username and password
+
+file_create(path = here(".netrc"))
+write(x = glue("machine urs.earthdata.nasa.gov login **** password ****"), file = here(".netrc"))
+netrc_path <- here(".netrc") 
+
+# >> Create ".urs_cookies" as a cookie file
+
+file_create(path = here(".urs_cookies"))
+cookie_path <- here(".urs_cookies")
+
+# >> Set configuration file
+
+set_config(config = httr::config(
+  followlocation = 1,
+  netrc = 1,
+  netrc_file = netrc_path,
+  cookie = cookie_path,
+  cookiefile = cookie_path,
+  cookiejar = cookie_path
+))
+
+# Download ----
+
+# >> Extract file names 
+
+filenames <- map_chr(.x = urls, .f = \(url){
+  if(str_detect(string = url, pattern = "pdf")){
+    filename <- basename(url)
+  } else {
+    filename <- str_extract(string = url, pattern = "LABEL\\=.*?\\&") |>
+      str_remove(pattern = "^LABEL\\=") |>
+      str_remove(pattern = "\\&$")
+  }
+  filename
+})
+
+# >> Create new version of httr::GET() which will continue even if there's an error
+
+GET_possibly <- possibly(.f = GET, otherwise = NULL)
+
+# >> Download files
+
+# Create progress bar
+pb <- progress_bar$new(
+  total = length(urls),
+  format = "  Downloading [:bar] :percent | :current/:total files"
+)
+
+walk2(.x = urls, .y = filenames, .f = \(url, file){
+  GET_possibly(url = url, write_disk(path = file, overwrite = TRUE))
+  
+  pb$tick()   # progress bar update
+})
+
+
+library(terra)
+library(sf)
+library(data.table)
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(ggspatial)
+# ----------------------------------------------------------
+# 1. Load Missouri shapefile
+# ----------------------------------------------------------
+usa <- st_read("gadm41_USA_2.shp", quiet = TRUE)
+
+shp <- usa %>%
+  filter(NAME_1 == "Missouri") %>%
+  st_transform(4326)
+
+shp_vect <- vect(shp)
+
+# Automatic extent from Missouri boundary
+auto_ext <- ext(shp_vect)
+
+# ----------------------------------------------------------
+# 2. List nc4 files
+# ----------------------------------------------------------
+nc_files <- list.files(pattern = "\\.nc4$", full.names = TRUE)
+
+# ----------------------------------------------------------
+# 3. Function: crop + mask + df extract
+# ----------------------------------------------------------
+process_nc <- function(nc_path) {
+  
+  r <- rast(nc_path)
+  
+  # Fix incorrect original extent by replacing with Missouri's extent
+  ext(r) <- auto_ext
+  
+  # Set coordinate reference system
+  crs(r) <- "EPSG:4326"
+  
+  # Extract date from filename (YYYYMMDD)
+  date_str <- str_extract(nc_path, "\\d{8}")
+  date_val <- as.Date(date_str, format = "%Y%m%d")
+  
+  # Crop + mask
+  r_crop <- crop(r, shp_vect)
+  r_mask <- mask(r_crop, shp_vect)
+  
+  # Convert to data.table
+  df <- as.data.frame(r_mask, xy = TRUE, na.rm = TRUE)
+  setDT(df)
+  
+  setnames(df, names(df)[3], "pre")   # rename variable
+  df[, date := date_val]             # add date column
+  
+  return(df)
+}
+
+# ----------------------------------------------------------
+# 4. Loop through all files with progress bar
+# ----------------------------------------------------------
+pb <- txtProgressBar(min = 0, max = length(nc_files), style = 3)
+
+output_list <- vector("list", length(nc_files))
+
+for(i in seq_along(nc_files)) {
+  output_list[[i]] <- process_nc(nc_files[i])
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+
+# ----------------------------------------------------------
+# 5. Combine all into one dataset
+# ----------------------------------------------------------
+df_all <- rbindlist(output_list)
+
+df_all[, pre_mm_day := pre * 24]
+
+df_all[, year  := as.integer(format(date, "%Y"))]
+df_all[, month := as.integer(format(date, "%m"))]
+df_all[, day   := as.integer(format(date, "%d"))]
+
+# Make sure df_all is data.table
+setDT(df_all)
+
+# Monthly mean
+df_monthly <- df_all[, .(
+  pre_month = mean(pre_mm_day, na.rm = TRUE)
+), by = .(x, y, year, month)]
+
+df_monthly[, month_name := factor(month, 
+                                  levels = 1:12,
+                                  labels = month.name)]
+
+vmin <- min(df_monthly$pre_month)
+vmax <- max(df_monthly$pre_month)
+
+breaks <- classInt::classIntervals(
+  df_monthly$pre_month, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+p = ggplot(df_monthly, aes(x = x, y = y, fill = pre_month)) +
+  geom_tile() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "black") +
+  scale_fill_gradientn(
+    name = "Precip. \n(mm)",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = 1)
+  )+
+  coord_sf() +
+  facet_wrap(~ month_name, ncol = 4) +
+  theme_minimal()+
+  #labs(fill = "Precipitation (mm/day)") +
+  # Reduce number of longitude (x) and latitude (y) breaks
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Monthly Mean Precipitation (2015–2025) in Missouri",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GPM IMERG"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(2.2, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+ggsave(
+  filename = "monthly_precipitation.jpeg",
+  plot = p,
+  width = 12, height = 9, units = "in",
+  dpi = 300
+)
+# Make sure df_all is data.table
+setDT(df_all)
+
+# Yearly mean per pixel
+df_yearly <- df_all[, .(
+  pre_year = mean(pre_mm_day, na.rm = TRUE)
+), by = .(x, y, year)]
+
+
+ggplot(df_yearly, aes(x = x, y = y, fill = pre_year)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Precip (mm)", option = "C") +
+  coord_equal() +
+  facet_wrap(~ year, ncol = 3) +  # Adjust ncol for better layout
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Yearly Mean Precipitation (mm)",
+    x = "Longitude", 
+    y = "Latitude"
+  )
+
+
+# Your data ------------------------------------------------------
+dt <- as.data.table(df_all)
+dt[, date := as.Date(date)]
+
+# 1. CREATE YEAR-MONTH ------------------------------------------
+dt[, ym := format(date, "%Y-%m")]
+
+# 2. MONTHLY PRECIPITATION SUM ----------------------------------
+dt_mon <- dt[, .(
+  pre_month = sum(pre, na.rm = TRUE)
+), by = .(x, y, year = year(date), month = month(date), ym)]
+
+setorder(dt_mon, x, y, year, month)
+
+# 3. LIST PIXELS FOR LOOPING ------------------------------------
+locs <- unique(dt_mon[, .(x, y)])
+
+# Storage for SPI results
+dt_mon[, SPI_1 := NA_real_]
+dt_mon[, SPI_3 := NA_real_]
+dt_mon[, SPI_6 := NA_real_]
+dt_mon[, SPI_12 := NA_real_]
+
+# 4. SPI CALCULATION PER PIXEL ----------------------------------
+for (i in 1:nrow(locs)) {
+  xx <- locs$x[i]
+  yy <- locs$y[i]
+  
+  tmp <- dt_mon[x == xx & y == yy]
+  p <- tmp$pre_month
+  
+  # SPI requires no all-zero series, so check precipitation
+  if (sum(p, na.rm = TRUE) > 0) {
+    # SPI-1
+    spi1  <- spi(p, scale = 1)$fitted
+    # SPI-3
+    spi3  <- spi(p, scale = 3)$fitted
+    # SPI-6
+    spi6  <- spi(p, scale = 6)$fitted
+    # SPI-12
+    spi12 <- spi(p, scale = 12)$fitted
+    
+    dt_mon[x == xx & y == yy, SPI_1 := spi1]
+    dt_mon[x == xx & y == yy, SPI_3 := spi3]
+    dt_mon[x == xx & y == yy, SPI_6 := spi6]
+    dt_mon[x == xx & y == yy, SPI_12 := spi12]
+  }
+}
+
+# 5. FINAL OUTPUT ------------------------------------------------
+spi_all <- dt_mon
+
+# Save result
+fwrite(spi_all, "SPI_monthly_x_y_1_3_6_12.csv")
+
