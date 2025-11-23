@@ -1,0 +1,229 @@
+library(fs)
+library(glue)
+library(here)
+library(httr)
+library(purrr)
+library(stringr)
+library(progress)
+
+# Get file URLs ----
+
+urls <- readLines("subset_M2T1NXFLX_5.12.4_20251123_151836_.txt", warn = FALSE)
+
+# Initial setup ----
+
+# >> Create directory for downloaded files
+
+dir_create(path = here("downloaded_files"))
+
+# >> Create ".netrc" file to store username and password
+
+file_create(path = here(".netrc"))
+write(x = glue("machine urs.earthdata.nasa.gov login **** password ****"), file = here(".netrc"))
+netrc_path <- here(".netrc") 
+
+# >> Create ".urs_cookies" as a cookie file
+
+file_create(path = here(".urs_cookies"))
+cookie_path <- here(".urs_cookies")
+
+# >> Set configuration file
+
+set_config(config = httr::config(
+  followlocation = 1,
+  netrc = 1,
+  netrc_file = netrc_path,
+  cookie = cookie_path,
+  cookiefile = cookie_path,
+  cookiejar = cookie_path
+))
+
+# Download ----
+
+# >> Extract file names 
+
+filenames <- map_chr(.x = urls, .f = \(url){
+  if(str_detect(string = url, pattern = "pdf")){
+    filename <- basename(url)
+  } else {
+    filename <- str_extract(string = url, pattern = "LABEL\\=.*?\\&") |>
+      str_remove(pattern = "^LABEL\\=") |>
+      str_remove(pattern = "\\&$")
+  }
+  filename
+})
+
+# >> Create new version of httr::GET() which will continue even if there's an error
+
+GET_possibly <- possibly(.f = GET, otherwise = NULL)
+
+# >> Download files
+
+# Create progress bar
+pb <- progress_bar$new(
+  total = length(urls),
+  format = "  Downloading [:bar] :percent | :current/:total files"
+)
+
+walk2(.x = urls, .y = filenames, .f = \(url, file){
+  GET_possibly(url = url, write_disk(path = file, overwrite = TRUE))
+  
+  pb$tick()   # progress bar update
+})
+
+library(terra)
+library(sf)
+library(data.table)
+library(lubridate)
+library(ggspatial)
+library(scales)
+library(ggplot2)
+
+# ---------------------------
+# 1. Read & filter shapefile
+# ---------------------------
+usa <- st_read("gadm41_USA_2.shp", quiet = TRUE)
+
+shp <- usa %>%
+  dplyr::filter(NAME_1 == "Missouri") %>%
+  st_transform(4326) |> 
+  vect()    # convert sf → SpatVector for terra
+
+
+# ---------------------------
+# 2. List all nc files
+# ---------------------------
+nc_files <- list.files(pattern = "\\.nc$", full.names = TRUE)
+
+
+# ---------------------------
+# 3. Function: process one NC
+# ---------------------------
+process_nc <- function(ncfile) {
+  
+  r <- rast(ncfile)
+  r <- crop(r, shp) |> mask(shp)
+  
+  ts <- time(r)
+  df <- as.data.table(as.data.frame(r, xy = TRUE, na.rm = TRUE))
+  
+  band_names <- names(r)
+  
+  df_long <- melt(
+    df,
+    id.vars = c("x", "y"),
+    measure.vars = band_names,
+    variable.name = "band",
+    value.name = "pr"
+  )
+  
+  setDT(df_long)
+  
+  df_long[, datetime := ts[match(band, band_names)]]
+  df_long[, date := as.Date(datetime)]
+  df_long[, time := format(datetime, "%H:%M:%S")]
+  
+  # -------- UNIT CONVERSION --------
+  df_long[, pr_mm := pr]            # mm/s
+  df_long[, pr_mm_hr := pr * 3600]  # mm/hr
+  # ---------------------------------
+  
+  df_long[, band := NULL]
+  
+  return(df_long)
+}
+
+
+# ---------------------------
+# 4. Process all NC files
+# ---------------------------
+
+pb <- progress_bar$new(
+  format = "Cropping & masking files [:bar] :current/:total (:percent) eta: :eta",
+  total = length(nc_files),
+  clear = FALSE, width = 60
+)
+
+process_nc_pb <- function(ncfile) {
+  pb$tick()
+  process_nc(ncfile)
+}
+
+final_dt <- rbindlist(lapply(nc_files, process_nc_pb))
+
+daily_precip <- final_dt[, .(
+  pr_mm_day = sum(pr_mm_hr)
+), by = .(x, y, date)]
+# ---------------------------
+# 5. Save result
+# ---------------------------
+fwrite(final_dt, "MERRA2_Missouri_precip_timeseries.csv")
+
+
+#✅ Correct Step 1 — Extract half-hour time label
+final_dt[, hour_label := format(datetime, "%H:%M")]
+#✅ Step 2 — Mean precipitation per time step
+hourly_mean <- final_dt[, .(
+  pr_mm_hr_mean = mean(pr_mm_hr, na.rm = TRUE)
+), by = .(x, y, hour_label)]
+#✅ Step 3 — Plot using geom_tile() + facet_wrap
+
+shp <- usa %>%
+  dplyr::filter(NAME_1 == "Missouri") %>%
+  st_transform(4326)
+vmin <- min(hourly_mean$pr_mm_hr_mean)
+vmax <- max(hourly_mean$pr_mm_hr_mean)
+
+breaks <- classInt::classIntervals(
+  hourly_mean$pr_mm_hr_mean, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+p = ggplot(hourly_mean, aes(x = x, y = y, fill = pr_mm_hr_mean)) +
+  geom_tile() +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey95")+
+  scale_fill_gradientn(
+    name = "Precip. \n(mm/hr)",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  ) +
+  coord_sf() +
+  facet_wrap(~ hour_label, nrow = 4, ncol = 6) +
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  labs(
+    title = "(A) Hourly Mean Precipitation (mm/hr) \n(2025-09-01–2025-11-01) in Missouri",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: MERRA-2"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 12, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(2.2, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+ggsave(
+  filename = "Hourly Mean Precipitation.jpeg",
+  plot = p,
+  width = 12, height = 9, units = "in",
+  dpi = 300
+)
