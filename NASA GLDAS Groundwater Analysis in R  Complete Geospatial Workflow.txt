@@ -1,0 +1,1001 @@
+library(fs)
+library(glue)
+library(here)
+library(httr)
+library(purrr)
+library(stringr)
+library(progress)
+
+# Get file URLs ----
+
+urls <- readLines("subset_GLDAS_CLSM025_DA1_D_2.2_20251130_160346_.txt", warn = FALSE)
+
+# Initial setup ----
+
+# >> Create directory for downloaded files
+
+dir_create(path = here("downloaded_files"))
+
+# >> Create ".netrc" file to store username and password
+
+file_create(path = here(".netrc"))
+write(x = glue("machine urs.earthdata.nasa.gov login **** password ****"), file = here(".netrc"))
+netrc_path <- here(".netrc") 
+
+# >> Create ".urs_cookies" as a cookie file
+
+file_create(path = here(".urs_cookies"))
+cookie_path <- here(".urs_cookies")
+
+# >> Set configuration file
+
+set_config(config = httr::config(
+  followlocation = 1,
+  netrc = 1,
+  netrc_file = netrc_path,
+  cookie = cookie_path,
+  cookiefile = cookie_path,
+  cookiejar = cookie_path
+))
+
+# Download ----
+
+# >> Extract file names 
+
+filenames <- map_chr(.x = urls, .f = \(url){
+  if(str_detect(string = url, pattern = "pdf")){
+    filename <- basename(url)
+  } else {
+    filename <- str_extract(string = url, pattern = "LABEL\\=.*?\\&") |>
+      str_remove(pattern = "^LABEL\\=") |>
+      str_remove(pattern = "\\&$")
+  }
+  filename
+})
+
+# >> Create new version of httr::GET() which will continue even if there's an error
+
+GET_possibly <- possibly(.f = GET, otherwise = NULL)
+
+# >> Download files
+
+# Create progress bar
+pb <- progress_bar$new(
+  total = length(urls),
+  format = "  Downloading [:bar] :percent | :current/:total files"
+)
+
+walk2(.x = urls, .y = filenames, .f = \(url, file){
+  GET_possibly(url = url, write_disk(path = file, overwrite = TRUE))
+  
+  pb$tick()   # progress bar update
+})
+
+
+
+library(terra)
+library(data.table)
+library(sf)
+library(lubridate)
+
+#-------------------------------------------------------
+# 1) Read & prepare shapefile (Missouri only)
+#-------------------------------------------------------
+usa <- st_read("gadm41_USA_2.shp", quiet = TRUE)
+
+shp <- usa |>
+  dplyr::filter(NAME_1 == "Missouri") |>
+  st_transform(4326) |>
+  vect()   # convert sf → SpatVector for terra
+
+#-------------------------------------------------------
+# 2) List all daily GLDAS NetCDF files
+#-------------------------------------------------------
+nc_files <- list.files(pattern = "\\.nc4$", full.names = TRUE)
+
+#-------------------------------------------------------
+# 3) Loop → crop, mask, extract values → store in data.table
+#-------------------------------------------------------
+pb <- progress_bar$new(
+  format = " Processing [:bar] :percent | File: :current/:total | ETA: :eta",
+  total = length(nc_files), clear = FALSE, width = 70
+)
+
+dt_list <- lapply(seq_along(nc_files), function(i) {
+  f <- nc_files[i]
+  
+  pb$tick()   # update progress bar
+  cat("\nReading:", basename(f), "\n")
+  
+  tryCatch({
+    
+    r <- rast(f, subds = "GWS_tavg")   # load variable only
+    r <- crop(r, shp)
+    r <- mask(r, shp)
+    
+    # Extract date from filename
+    date_str <- gsub(".*A(\\d{8}).*", "\\1", basename(f))
+    d <- as.Date(date_str, format = "%Y%m%d")
+    
+    # Convert to data.table
+    dt <- as.data.table(as.data.frame(r, xy = TRUE, na.rm = TRUE))
+    setnames(dt, c("x", "y", "GWS"))
+    dt[, date := d]
+    
+    return(dt)
+    
+  }, error = function(e) {
+    cat("Error in file:", f, " → ", e$message, "\n")
+    return(NULL)
+  })
+})
+
+dt_daily <- rbindlist(dt_list, use.names = TRUE, fill = TRUE)
+
+#-------------------------------------------------------
+# 4) Convert daily → monthly mean
+#-------------------------------------------------------
+dt_daily[, month := as.Date(format(date, "%Y-%m-01"))]
+
+dt_monthly <- dt_daily[, .(
+  GWS = mean(GWS, na.rm = TRUE)
+), by = .(x, y, month)]
+
+#-------------------------------------------------------
+# 5) Final Output
+#-------------------------------------------------------
+dt_monthly
+
+
+library(ggplot2)
+library(patchwork)  # for combining plots
+library(zoo)
+library(spdep)
+library(gstat)
+library(scales)
+library(ggspatial)
+library(gridExtra)
+library(ranger)
+
+#----------------------------------------
+# 1) Prepare indices
+#----------------------------------------
+dt <- copy(dt_monthly)
+dt[, m := month(month)]
+
+# Long-term mean & sd per grid cell for SGI
+dt_stats <- dt[, .(
+  mean_gws = mean(GWS, na.rm = TRUE),
+  sd_gws   = sd(GWS, na.rm = TRUE)
+), by = .(x,y,m)]
+
+dt <- merge(dt, dt_stats, by = c("x","y","m"))
+
+# Calculate indices
+dt[, SGI := (GWS - mean_gws)/sd_gws]      # Standardized Groundwater Index
+dt[, GWA := GWS - mean_gws]               # Groundwater anomaly
+dt[, PoN := 100*GWS/mean_gws]            # Percent of Normal
+
+# Rolling SGI (6-month)
+setorder(dt, x, y, month)
+dt[, SGI_6m := zoo::rollapply(SGI, 6, mean, fill = NA, align = "right"), by = .(x,y)]
+
+#----------------------------------------
+# 2) Convert data.table → SpatRaster per month
+#----------------------------------------
+create_raster <- function(dt_idx, val_col){
+  rast_list <- lapply(unique(dt_idx$month), function(m){
+    sub <- dt_idx[month == m]
+    r <- terra::rastFromXYZ(sub[, .(x,y,get(val_col))])
+    names(r) <- format(m, "%Y-%m")
+    r
+  })
+  do.call(terra::c, rast_list)
+}
+
+create_raster <- function(dt_idx, val_col){
+  rast_list <- lapply(unique(dt_idx$month), function(m){
+    sub <- dt_idx[month == m]
+    
+    # Remove NA values
+    sub <- sub[!is.na(sub[[val_col]]), ]
+    
+    # Skip if no data
+    if(nrow(sub) == 0) return(NULL)
+    
+    df <- data.frame(x = sub$x, y = sub$y, z = sub[[val_col]])
+    
+    # Create raster from xyz
+    r <- rast(df, type = "xyz")
+    names(r) <- format(m, "%Y-%m")
+    r
+  })
+  
+  # Remove NULL layers if any
+  rast_list <- rast_list[!sapply(rast_list, is.null)]
+  
+  # Combine rasters
+  do.call(c, rast_list)
+}
+
+# Example
+r_SGI     <- create_raster(dt, "SGI")#Standardized Groundwater Index (SGI)
+r_GWA     <- create_raster(dt, "GWA")#Groundwater Anomaly (GWA)
+r_PoN     <- create_raster(dt, "PoN") #Percent of Normal (PoN)
+r_SGI_6m  <- create_raster(dt, "SGI_6m") #Rolling SGI (SGI_n-month)
+#----------------------------------------
+# 3) Plot example for latest month
+#----------------------------------------
+latest_month <- max(dt$month)
+dt_plot <- dt[month == latest_month]
+vmin <- min(dt_plot$SGI)
+vmax <- max(dt_plot$SGI)
+
+breaks <- classInt::classIntervals(
+  dt_plot$SGI, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+shp <- usa |>
+  dplyr::filter(NAME_1 == "Missouri") |>
+  st_transform(4326)
+#Standardized Groundwater Index (SGI)
+SGI <- ggplot(dt_plot, aes(x=x, y=y, fill=SGI)) + 
+  geom_tile() + 
+  scale_fill_gradientn(
+    name = "SGI",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "SGI 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+vmin <- min(dt_plot$GWA)
+vmax <- max(dt_plot$GWA)
+
+breaks <- classInt::classIntervals(
+  dt_plot$GWA, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+#Groundwater Anomaly (GWA)
+GWA <- ggplot(dt_plot, aes(x=x, y=y, fill=GWA)) + 
+  geom_tile() + 
+  scale_fill_gradientn(
+    name = "GWA",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "GWA 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+vmin <- min(dt_plot$PoN)
+vmax <- max(dt_plot$PoN)
+
+breaks <- classInt::classIntervals(
+  dt_plot$PoN, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+# Percent of Normal (PoN)
+PON <- ggplot(dt_plot, aes(x=x, y=y, fill=PoN)) + 
+  geom_tile() +
+  scale_fill_gradientn(
+    name = "PON",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "PON 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+vmin <- min(dt_plot$SGI_6m)
+vmax <- max(dt_plot$SGI_6m)
+
+breaks <- classInt::classIntervals(
+  dt_plot$SGI_6m, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+# Rolling SGI (SGI_n-month)
+SGI_6m <- ggplot(dt_plot, aes(x=x, y=y, fill=SGI_6m)) + 
+  geom_tile() + scale_fill_gradientn(
+    name = "SGI_6m",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "SGI_6month 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+SGI, GWA, PON, SGI_6m
+
+
+#----------------------------------------
+# 1) Prepare dt
+#----------------------------------------
+dt <- copy(dt_monthly)
+dt[, m := month(month)]
+dt[, time_num := as.numeric(month)]  # for slope
+
+#----------------------------------------
+# 2) Additional indices
+#----------------------------------------
+
+# GDI - Groundwater depletion severity
+dt[, GDI := (GWS - min(GWS, na.rm=TRUE)) / (max(GWS, na.rm=TRUE) - min(GWS, na.rm=TRUE)), by=.(x,y)]
+
+# CV - Coefficient of Variation
+dt[, CV := sd(GWS, na.rm=TRUE)/mean(GWS, na.rm=TRUE), by=.(x,y)]
+
+# Slope - long-term trend
+dt[, slope := coef(lm(GWS ~ time_num))[2], by=.(x,y)]
+
+# DSI - Drought Severity Index (based on SGI)
+# First calculate SGI
+dt_stats <- dt[, .(
+  mean_gws = mean(GWS, na.rm=TRUE),
+  sd_gws   = sd(GWS, na.rm=TRUE)
+), by=.(x,y,m)]
+dt <- merge(dt, dt_stats, by=c("x","y","m"))
+dt[, SGI := (GWS - mean_gws)/sd_gws]
+dt[, DSI := cut(SGI,
+                breaks=c(-Inf,-2,-1.5,-1,1,1.5,2,Inf),
+                labels=c("ExtD","SevD","ModD","Normal","ModW","SevW","ExtW"))]
+
+# Seasonal z-score
+dt[, season := fifelse(month(month) %in% c(12,1,2), "Winter",
+                       fifelse(month(month) %in% 3:5, "Spring",
+                               fifelse(month(month) %in% 6:8, "Summer","Fall")))]
+dt[, GWS_season_mean := mean(GWS, na.rm=TRUE), by=.(x,y,season)]
+dt[, GWS_z := (GWS - GWS_season_mean)/sd(GWS, na.rm=TRUE), by=.(x,y,season)]
+
+#----------------------------------------
+# 3) Function to convert to raster
+#----------------------------------------
+create_raster <- function(dt_idx, val_col){
+  rast_list <- lapply(unique(dt_idx$month), function(m){
+    sub <- dt_idx[month == m]
+    sub <- sub[!is.na(sub[[val_col]]), ]
+    if(nrow(sub)==0) return(NULL)
+    df <- data.frame(x=sub$x, y=sub$y, z=sub[[val_col]])
+    r <- rast(df, type="xyz")
+    names(r) <- format(m, "%Y-%m")
+    r
+  })
+  rast_list <- rast_list[!sapply(rast_list, is.null)]
+  do.call(c, rast_list)
+}
+
+#----------------------------------------
+# 4) Create rasters
+#----------------------------------------
+r_GDI    <- create_raster(dt, "GDI") #Groundwater Deficit Index (GDI)
+r_CV     <- create_raster(dt, "CV") #Coefficient of Variation (CV)
+r_Slope  <- create_raster(dt, "slope") #Long-term trend (increase/decrease)
+r_DSI    <- create_raster(dt, "DSI")   # Drought Severity Index (DSI) based on GWS)
+r_GWS_z  <- create_raster(dt, "GWS_z") #Anomaly z-score per year/season
+
+#----------------------------------------
+# 5) Plot maps for latest month
+#----------------------------------------
+latest_month <- max(dt$month)
+dt_plot <- dt[month==latest_month]
+
+vmin <- min(dt_plot$GDI)
+vmax <- max(dt_plot$GDI)
+
+breaks <- classInt::classIntervals(
+  dt_plot$GDI, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+#Groundwater Deficit Index (GDI)
+GDI <- ggplot(dt_plot, aes(x=x, y=y, fill=GDI)) +
+  geom_tile() + scale_fill_gradientn(
+    name = "GDI",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "GDI 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+vmin <- min(dt_plot$CV)
+vmax <- max(dt_plot$CV)
+
+breaks <- classInt::classIntervals(
+  dt_plot$CV, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+
+#Coefficient of Variation (CV)
+CV <- ggplot(dt_plot, aes(x=x, y=y, fill=CV)) +
+  geom_tile() + scale_fill_gradientn(
+    name = "CV",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "CV 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+vmin <- min(dt_plot$slope)
+vmax <- max(dt_plot$slope)
+
+breaks <- classInt::classIntervals(
+  dt_plot$slope, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+#Long-term trend (increase/decrease)
+slope <- ggplot(dt_plot, aes(x=x, y=y, fill=slope)) +
+  geom_tile() + scale_fill_gradientn(
+    name = "slope",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .005)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "slope 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+
+#Drought severity classification
+DSI <- ggplot(dt_plot, aes(x=x, y=y, fill=DSI)) +
+  geom_tile() + scale_fill_manual(values=c(
+    "ExtD"="#67001F", "SevD"="#B2182B", "ModD"="#D6604D", "Normal"="#F7F7F7",
+    "ModW"="#92C5DE", "SevW"="#2166AC", "ExtW"="#053061")) +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "DSI 2025-07-01",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+vmin <- min(dt_plot$GWS_z)
+vmax <- max(dt_plot$GWS_z)
+
+breaks <- classInt::classIntervals(
+  dt_plot$GWS_z, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+#Seasonal anomaly detection
+z_score <- ggplot(dt_plot, aes(x=x, y=y, fill=GWS_z)) +
+  geom_tile() + scale_fill_gradientn(
+    name = "Z-score",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = label_number(accuracy = .05)
+  )+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "Seasonal Z-score",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+
+# Combine plots
+GDI, CV, slope, DSI, z_score
+
+#----------------------------------------
+# 1) Prepare dt for spatial analysis
+#----------------------------------------
+dt <- copy(dt_monthly)
+
+# Choose a month to visualize/analyze (example: latest month)
+latest_month <- max(dt$month)
+dt_month <- dt[month == latest_month]
+
+# Convert to sf object
+sf_points <- st_as_sf(dt_month, coords = c("x","y"), crs=4326)
+
+# Convert to projected CRS for spatial stats (meters)
+sf_points_proj <- st_transform(sf_points, 3857)
+
+#----------------------------------------
+# 2) Create neighbors for Moran's I & Gi*
+#----------------------------------------
+coords <- st_coordinates(sf_points_proj)
+knn_nb <- knn2nb(knearneigh(coords, k=4))
+listw <- nb2listw(knn_nb, style="W")
+
+#----------------------------------------
+# 3) Moran's I (spatial autocorrelation)
+#----------------------------------------
+moran <- moran.test(sf_points_proj$GWS, listw)
+print(moran)
+
+#----------------------------------------
+# 4) Getis-Ord Gi* (hotspot analysis)
+#----------------------------------------
+# localG returns numeric vector
+gi_star <- as.numeric(localG(sf_points_proj$GWS, listw))
+sf_points_proj$Gi_star <- gi_star
+
+# Now ggplot will work
+p_gi <- ggplot(sf_points_proj) +
+  geom_sf(aes(color=Gi_star)) +
+  scale_color_gradient2(low="blue", mid="white", high="red", midpoint=0) +
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "Getis-Ord Gi* Hotspots",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+
+dt <- copy(dt_monthly)
+
+#--------------------------------------------------
+# 1. CREATE PROGRESS BAR
+#--------------------------------------------------
+pb <- progress_bar$new(
+  total = 4,
+  format = "  Processing [:bar] :percent | :current/:total | ETA: :eta"
+)
+
+pb$tick()
+
+#--------------------------------------------------
+# 2. PREPARE GEOAI DATA
+#--------------------------------------------------
+dt[, month_num := as.integer(format(month, "%m"))]
+dt[, year := as.integer(format(month, "%Y"))]
+
+pb$tick()
+
+#--------------------------------------------------
+# 3. TRAIN RANDOM FOREST (GeoAI)
+#--------------------------------------------------
+rf_model <- ranger(
+  GWS ~ x + y + month_num + year,
+  data = dt,
+  num.trees = 500,
+  mtry = 3,
+  importance = "impurity"
+)
+
+dt[, GWS_pred := predict(rf_model, dt)$predictions]
+
+pb$tick()
+
+#--------------------------------------------------
+# 4. MAKE SPATIAL MAPS
+#--------------------------------------------------
+
+# Convert to raster for mapping
+r_gws <- rast(
+  data.frame(x = dt$x, y = dt$y, GWS = dt$GWS),
+  type = "xyz"
+)
+
+r_pred <- rast(
+  data.frame(x = dt$x, y = dt$y, GWS_pred = dt$GWS_pred),
+  type = "xyz"
+)
+
+# Convert to data.table for ggplot
+gws_map <- as.data.table(as.data.frame(r_gws, xy = TRUE))
+pred_map <- as.data.table(as.data.frame(r_pred, xy = TRUE))
+
+pb$tick()
+
+#--------------------------------------------------
+# 5. PLOTS
+#--------------------------------------------------
+vmin <- min(gws_map$GWS)
+vmax <- max(gws_map$GWS)
+
+breaks <- classInt::classIntervals(
+  gws_map$GWS, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+# ORIGINAL GWS MAP
+Observe_map <- ggplot(gws_map) +
+  geom_tile(aes(x = x, y = y, fill = GWS)) +
+scale_fill_gradientn(
+  name = "GWS\n (mm)",
+  colours = colors,
+  limits = c(vmin, vmax),
+  breaks = seq(vmin, vmax, length.out = 5),
+  labels = label_number(accuracy = .05)
+)+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "Observed GWS",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+vmin <- min(pred_map$GWS_pred)
+vmax <- max(pred_map$GWS_pred)
+
+breaks <- classInt::classIntervals(
+  pred_map$GWS_pred, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+
+# GEOAI PREDICTED GWS MAP
+Pred_GWS <- ggplot(pred_map) +
+  geom_tile(aes(x = x, y = y, fill = GWS_pred)) +
+scale_fill_gradientn(
+  name = "Pred GWS\n (mm)",
+  colours = colors,
+  limits = c(vmin, vmax),
+  breaks = seq(vmin, vmax, length.out = 5),
+  labels = label_number(accuracy = .05)
+)+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "GeoAI Predicted GWS",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+# TREND GRAPH
+trend <- dt[, .(mean_GWS = mean(GWS)), by = year]
+
+p3 <- ggplot(trend, aes(year, mean_GWS)) +
+  geom_line(size = 1.1, color = "blue") +
+  geom_point(size = 2, color = "red") +
+  labs(title = "GWS Trend Over Time", x = "Year", y = "Mean GWS") +
+  theme_minimal()
+
+p_gi, Observe_map, Pred_GWS, GDI, CV, slope, DSI, z_score, SGI, GWA, PON, SGI_6m
+
+final_patch <- (p_gi | Observe_map | Pred_GWS | GDI) /
+  (CV | slope | DSI | z_score) /
+  (SGI | GWA | PON | SGI_6m) 
+
+# Save the combined figure
+ggsave(
+  filename = "final_maps_patchwork.jpeg",
+  plot = final_patch,
+  width = 16,    # Adjust based on desired size
+  height = 9,
+  dpi = 300
+)
