@@ -1,0 +1,352 @@
+library(fs)
+library(glue)
+library(here)
+library(httr)
+library(purrr)
+library(stringr)
+library(progress)
+
+# Get file URLs ----
+
+urls <- readLines("subset_GLDAS_CLSM025_DA1_D_2.2_20251208_150824_.txt", warn = FALSE)
+
+# Initial setup ----
+
+# >> Create directory for downloaded files
+
+dir_create(path = here("downloaded_files"))
+
+# >> Create ".netrc" file to store username and password
+
+file_create(path = here(".netrc"))
+write(x = glue("machine urs.earthdata.nasa.gov login *** password ***"), file = here(".netrc"))
+netrc_path <- here(".netrc") 
+
+# >> Create ".urs_cookies" as a cookie file
+
+file_create(path = here(".urs_cookies"))
+cookie_path <- here(".urs_cookies")
+
+# >> Set configuration file
+
+set_config(config = httr::config(
+  followlocation = 1,
+  netrc = 1,
+  netrc_file = netrc_path,
+  cookie = cookie_path,
+  cookiefile = cookie_path,
+  cookiejar = cookie_path
+))
+
+# Download ----
+
+# >> Extract file names 
+
+filenames <- map_chr(.x = urls, .f = \(url){
+  if(str_detect(string = url, pattern = "pdf")){
+    filename <- basename(url)
+  } else {
+    filename <- str_extract(string = url, pattern = "LABEL\\=.*?\\&") |>
+      str_remove(pattern = "^LABEL\\=") |>
+      str_remove(pattern = "\\&$")
+  }
+  filename
+})
+
+# >> Create new version of httr::GET() which will continue even if there's an error
+
+GET_possibly <- possibly(.f = GET, otherwise = NULL)
+
+# >> Download files
+
+# Create progress bar
+pb <- progress_bar$new(
+  total = length(urls),
+  format = "  Downloading [:bar] :percent | :current/:total files"
+)
+
+walk2(.x = urls, .y = filenames, .f = \(url, file){
+  GET_possibly(url = url, write_disk(path = file, overwrite = TRUE))
+  
+  pb$tick()   # progress bar update
+})
+
+
+
+library(terra)
+library(data.table)
+library(sf)
+library(lubridate)
+
+#-------------------------------------------------------
+# 1) Read & prepare shapefile (Missouri only)
+#-------------------------------------------------------
+usa <- st_read("gadm41_USA_2.shp", quiet = TRUE)
+
+shp <- usa |>
+  dplyr::filter(NAME_1 == "Missouri") |>
+  st_transform(4326) |>
+  vect()   # convert sf → SpatVector for terra
+
+#-------------------------------------------------------
+# 2) List all daily GLDAS NetCDF files
+#-------------------------------------------------------
+nc_files <- list.files(pattern = "\\.nc4$", full.names = TRUE)
+
+#-------------------------------------------------------
+# 3) Loop → crop, mask, extract values → store in data.table
+#-------------------------------------------------------
+pb <- progress_bar$new(
+  format = " Processing [:bar] :percent | File: :current/:total | ETA: :eta",
+  total = length(nc_files), clear = FALSE, width = 70
+)
+
+dt_list <- lapply(seq_along(nc_files), function(i) {
+  f <- nc_files[i]
+  
+  pb$tick()   # update progress bar
+  cat("\nReading:", basename(f), "\n")
+  
+  tryCatch({
+    
+    r <- rast(f, subds = "SoilMoist_S_tavg")   # load variable only
+    r <- crop(r, shp)
+    r <- mask(r, shp)
+    
+    # Extract date from filename
+    date_str <- gsub(".*A(\\d{8}).*", "\\1", basename(f))
+    d <- as.Date(date_str, format = "%Y%m%d")
+    
+    # Convert to data.table
+    dt <- as.data.table(as.data.frame(r, xy = TRUE, na.rm = TRUE))
+    setnames(dt, c("x", "y", "SoilMoist_S_tavg"))
+    dt[, date := d]
+    
+    return(dt)
+    
+  }, error = function(e) {
+    cat("Error in file:", f, " → ", e$message, "\n")
+    return(NULL)
+  })
+})
+
+dt_daily <- rbindlist(dt_list, use.names = TRUE, fill = TRUE)
+
+#-------------------------------------------------------
+# 4) Convert daily → monthly mean
+#-------------------------------------------------------
+dt_daily[, month := as.Date(format(date, "%Y-%m-01"))]
+
+dt_monthly <- dt_daily[, .(
+  SoilMoist_S_tavg = mean(SoilMoist_S_tavg, na.rm = TRUE)
+), by = .(x, y, month)]
+
+#-------------------------------------------------------
+# 5) Final Output
+#-------------------------------------------------------
+dt_monthly
+
+
+
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(viridis)
+
+# -------------------------------------------------
+# PREP DATA
+# -------------------------------------------------
+dt <- as.data.table(dt_monthly)
+dt[, month_num := month(month)]
+dt[, year := year(month)]
+
+# -------------------------------------------------
+# 1) SMI
+# -------------------------------------------------
+dt[, SMI := (SoilMoist_S_tavg - min(SoilMoist_S_tavg)) /
+     (max(SoilMoist_S_tavg) - min(SoilMoist_S_tavg))]
+
+# -------------------------------------------------
+# 2) Climatology for SMA + SSI
+# -------------------------------------------------
+clim <- dt[, .(clim_mean = mean(SoilMoist_S_tavg),
+               clim_sd   = sd(SoilMoist_S_tavg)),
+           by = month_num]
+
+dt <- merge(dt, clim, by = "month_num", all.x = TRUE)
+
+dt[, SMA := SoilMoist_S_tavg - clim_mean]
+dt[, SSI := (SoilMoist_S_tavg - clim_mean) / clim_sd]
+
+# -------------------------------------------------
+# 3) SMD
+# -------------------------------------------------
+dt[, SMD := max(SoilMoist_S_tavg) - SoilMoist_S_tavg]
+
+# -------------------------------------------------
+# MONTHLY MEANS (2023–2025)
+# -------------------------------------------------
+monthly_mean <- dt[year %in% 2020:2025,
+                   .(SMI = mean(SMI),
+                     SSI = mean(SSI),
+                     SMA = mean(SMA),
+                     SMD = mean(SMD)),
+                   by = .(x, y, month_num)]
+
+# Create month labels as ordered factor
+monthly_mean[, month_lab := factor(month.abb[month_num],
+                                   levels = month.abb)]
+
+# Plot SMI
+ggplot(monthly_mean, aes(x = x, y = y, fill = SMA)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  coord_equal() +
+  facet_wrap(~ month_lab, ncol = 4) +
+  theme_minimal(base_size = 12) +
+  labs(title = "Monthly Mean SMI (2020–2025)", fill = "SMI")
+
+#Relative Soil Moisture Index (RSMI)
+dt[, RSMI := (SoilMoist_S_tavg - min(SoilMoist_S_tavg)) /
+     (max(SoilMoist_S_tavg) - min(SoilMoist_S_tavg)), by = .(x, y)]
+#Soil Moisture Anomaly Percent (SMAP) Positive = wetter than normal, Negative = drier than normal
+dt[, SMAP := ((SoilMoist_S_tavg - clim_mean)/clim_mean) * 100]
+#Drought Severity Index (DSI) Positive DSI = dry conditions, Negative = wet conditions
+dt[, DSI := -1 * (SoilMoist_S_tavg - clim_mean)/clim_sd]
+#Soil Moisture Percentile (SMP) 0–1 scale, shows relative dryness/wetness
+dt[, SMP := ecdf(SoilMoist_S_tavg)(SoilMoist_S_tavg), by = .(x, y)]
+
+# Month labels ordered
+monthly_mean[, month_lab := factor(month.abb[month_num], levels = month.abb)]
+
+# Calculate monthly mean RSMI (example)
+monthly_mean_RSMI <- dt[, .(RSMI = mean(RSMI)), by = .(x, y, month_num)]
+monthly_mean_RSMI[, month_lab := factor(month.abb[month_num], levels = month.abb)]
+
+ggplot(dt, aes(x = x, y = y, fill = SMP)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  facet_wrap(~ month_num, ncol = 4) +
+  coord_equal() +
+  theme_minimal(base_size = 12) +
+  labs(title = "Monthly Mean Relative Soil Moisture Index (RSMI)", fill = "RSMI")
+
+library(data.table)
+library(xgboost)
+library(ggplot2)
+library(viridis)
+library(Matrix)
+library(scales)
+library(ggspatial)
+# -----------------------------
+# Prepare Data
+# -----------------------------
+dt_ml <- copy(dt)
+
+# Features
+features <- c("SMI", "SSI", "SMA", "SMD", "RSMI", "SMAP", "DSI", "SMP", "month_num", "x", "y", "year")
+target <- "SoilMoist_S_tavg"
+
+# Convert to matrix
+X <- as.matrix(dt_ml[, ..features])
+y <- dt_ml[[target]]
+
+# -----------------------------
+# Train XGBoost model
+# -----------------------------
+set.seed(123)
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+# -----------------------------
+# Predict Soil Moisture
+# -----------------------------
+dt_ml[, SoilMoist_pred := predict(xgb_model, newdata = dtrain)]
+
+# -----------------------------
+# Monthly Mean Prediction (2023-2025)
+# -----------------------------
+monthly_pred <- dt_ml[year %in% 2023:2025,
+                      .(SoilMoist_pred = mean(SoilMoist_pred)),
+                      by = .(x, y, month_num)]
+
+monthly_pred[, month_lab := factor(month.abb[month_num], levels = month.abb)]
+
+# -----------------------------
+# Plot Facet Map
+# -----------------------------
+
+vmin <- min(monthly_pred$SoilMoist_pred)
+vmax <- max(monthly_pred$SoilMoist_pred)
+
+breaks <- classInt::classIntervals(
+  monthly_pred$SoilMoist_pred, n = 18, style = "pretty"
+)$brks
+
+colors = c( "#f2f8ff","#c4daf1", "#3c91cb","#fbbefd", "#9400d0", 
+            "#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+shp <- usa |>
+  dplyr::filter(NAME_1 == "Missouri") |>
+  st_transform(4326)
+final_patch = ggplot(monthly_pred, aes(x = x, y = y, fill = SoilMoist_pred)) +
+  geom_tile() +
+scale_fill_gradientn(
+  name = "Soil Moisture\n kg/m²",
+  colours = colors,
+  limits = c(vmin, vmax),
+  breaks = seq(vmin, vmax, length.out = 5),
+  labels = label_number(accuracy = 1)
+)+ 
+  geom_sf(data = shp, inherit.aes = FALSE, fill = NA, color = "grey60")+
+  coord_sf() + 
+  facet_wrap(~ month_lab, ncol = 4) +
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(-95, -89, by = 2)) +  # adjust as needed
+  scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "Predicted Soil Moisture (XGBoost) Monthly Mean 2020-2025",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: GLDAS"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+ggsave(
+  filename = "Predicted Soil Moisture (XGBoost) Monthly Mean 2020-2025.jpeg",
+  plot = final_patch,
+  width = 12,    # Adjust based on desired size
+  height = 8,
+  dpi = 300
+)
