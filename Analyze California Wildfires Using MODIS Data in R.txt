@@ -1,0 +1,251 @@
+library(lwgeom)
+library(sf)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(lwgeom)
+library(R.utils)   # 👈 VERY IMPORTANT for .gz
+library(lubridate)
+library(ggplot2)
+library(scales)
+library(ggspatial)
+usa <- st_read("gadm41_USA_2.shp", quiet = TRUE)
+
+shp <- usa |>
+  dplyr::filter(NAME_1 == "California") |>
+  st_transform(4326)
+shp <- shp |> 
+  st_make_valid() 
+
+burn_to_date <- function(year, burn_doy) {
+  as.Date(burn_doy - 1, origin = paste0(year, "-01-01"))
+}
+
+extract_fire_archive <- function(archive_path, out_dir) {
+  
+  message("   📦 Extracting: ", basename(archive_path))
+  
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  if (grepl("\\.tar\\.gz$|\\.tgz$", archive_path)) {
+    
+    utils::untar(archive_path, exdir = out_dir)
+    
+  } else if (grepl("\\.gz$", archive_path)) {
+    
+    R.utils::gunzip(
+      archive_path,
+      destname = file.path(out_dir, basename(sub("\\.gz$", "", archive_path))),
+      overwrite = TRUE,
+      remove = FALSE
+    )
+  }
+  
+  shp <- list.files(
+    out_dir,
+    pattern = "burndate\\.shp$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  
+  if (length(shp) == 0) {
+    message("   ⚠️ No shapefile found after extraction")
+    return(NULL)
+  }
+  
+  message("   ✅ Shapefile found")
+  shp[1]
+}
+process_one_year <- function(year_folder) {
+  
+  message("📅 Processing year: ", year_folder)
+  
+  year <- as.integer(year_folder)
+  
+  archives <- list.files(
+    path = year_folder,
+    pattern = "burndate.*(\\.tar\\.gz|\\.tgz|\\.gz)$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  
+  message("   🔍 Archives found: ", length(archives))
+  
+  if (length(archives) == 0) return(NULL)
+  
+  purrr::map_dfr(archives, function(a) {
+    
+    tmp_dir <- tempfile(pattern = paste0("fire_", year, "_"))
+    shp_file <- extract_fire_archive(a, tmp_dir)
+    
+    if (is.null(shp_file)) return(NULL)
+    
+    message("   🔥 Reading + clipping fire data")
+    
+    fire <- st_read(shp_file, quiet = TRUE) |>
+      st_transform(4326) |>
+      st_make_valid()
+    
+    fire_clip <- st_intersection(fire, st_geometry(shp))
+    
+    fire_clip |>
+      mutate(
+        Year = year,
+        BurnDate_Date = burn_to_date(year, BurnDate)
+      )
+  })
+}
+years <- 2020:2025
+fire_all <- purrr::map_dfr(years, ~ process_one_year(as.character(.x)))
+
+years <- unique(fire_all$Year)
+
+fire_all_clip <- purrr::map_dfr(years, function(y) {
+  message("Processing year: ", y)
+  tmp <- fire_all[fire_all$Year == y, ]
+  st_intersection(st_make_valid(tmp), st_geometry(shp))
+})
+
+fire_all_clip %>%
+  st_drop_geometry() %>%
+  group_by(Year) %>%
+  summarise(n_fires = n())
+
+# Project to California Albers Equal Area (meters)
+fire_all_clip_proj <- st_transform(fire_all_clip, 3310)
+#Calculate area in km²
+fire_all_clip_proj <- fire_all_clip_proj %>%
+  mutate(AREA_km2 = as.numeric(st_area(.)) / 1e6)  # st_area returns m²
+#Total burned area per year:
+fire_all_clip_proj %>%
+  st_drop_geometry() %>%
+  group_by(Year) %>%
+  summarise(total_burn_km2 = sum(AREA_km2, na.rm = TRUE))
+
+
+
+#Step 1: Add Month column
+fire_all_clip_proj <- fire_all_clip_proj %>%
+  mutate(Month = month(BurnDate_Date, label = TRUE, abbr = TRUE))  # Jan, Feb, ...
+#🔹 Step 2: Aggregate burned area per month (all years combined)
+fire_monthly <- fire_all_clip_proj %>%
+  st_drop_geometry() %>%
+  group_by(Month) %>%
+  summarise(total_burn_km2 = sum(AREA_km2, na.rm = TRUE)) %>%
+  ungroup()
+#🔹 Step 3: Optional: aggregate per year per month for facet_wrap
+fire_monthly_year <- fire_all_clip_proj %>%
+  mutate(Month = month(BurnDate_Date, label = TRUE, abbr = TRUE)) %>%
+  group_by(Year,Month) %>%
+  summarise(total_burn_km2 = sum(AREA_km2, na.rm = TRUE)) %>%
+  ungroup()
+#🔹 Step 4: Map polygons (facet_wrap by Month)
+shp1 <- usa |>
+  dplyr::filter(NAME_1 == "California") |>
+  st_transform(4326)
+
+ggplot() +
+  geom_sf(data = fire_monthly_year, aes(fill = total_burn_km2), color = NA) +
+  geom_sf(data = shp1, inherit.aes = FALSE, fill = NA, color = "grey90")+
+  facet_wrap(~Month, ncol = 3) +
+  scale_fill_viridis_c(option = "magma", trans = "sqrt") +
+  theme_minimal() +
+  labs(
+    title = "California Fire Burned Area by Month (2020–2025)",
+    fill = "Area (km²)"
+  )
+fire_jas <- fire_monthly_year %>%
+  filter(Month %in% c("Jun","Jul", "Aug", "Sep"))
+
+#Name: NAD83 / California Albers
+#EPSG: 3310
+#Units: meters
+#Projection: Albers Equal Area
+#Datum: NAD83
+
+# 🔹 Project both layers to planar CRS (California Albers EPSG:3310)
+fire_jas_proj <- st_transform(fire_jas, 3310)
+shp1_proj <- st_transform(shp1, 3310)
+
+# 🔹 Filter only JAS months
+fire_jas_proj <- fire_jas_proj %>% filter(Month %in% c("Jun","Jul","Aug","Sep"))
+
+# 🔹 Fix invalid geometries
+fire_jas_proj <- st_make_valid(fire_jas_proj)
+shp1_proj <- st_make_valid(shp1_proj)
+
+# 🔹 Create 40x40 square grid over California
+grid <- st_make_grid(
+  st_union(shp1_proj),   # 1️⃣ Take the union of all California polygons to form a single geometry
+  n = c(40, 40),         # 2️⃣ Split the bounding box into 40 columns x 40 rows → total 1600 grid cells
+  what = "polygons",     # 3️⃣ Return grid cells as polygons (instead of points or lines)
+  square = TRUE          # 4️⃣ Make cells square-shaped
+) %>% 
+  st_sf(grid_id = seq_along(.))  # 5️⃣ Convert the grid (list of polygons) into an sf object and assign a unique grid_id
+
+# 🔹 Intersect fire polygons with grid safely
+fire_grid <- st_intersection(grid, fire_jas_proj)
+
+# 🔹 Aggregate burned area per grid cell per month
+fire_grid_summary <- fire_grid %>%
+  st_drop_geometry() %>%
+  group_by(grid_id, Month) %>%
+  summarise(burn_km2 = sum(total_burn_km2, na.rm = TRUE), .groups = "drop")
+
+# 🔹 Join back geometry
+grid_plot <- grid %>%
+  semi_join(fire_grid_summary, by = "grid_id") %>%  # only keep grid cells with fires
+  left_join(fire_grid_summary, by = "grid_id")
+
+# 🔹 Plot
+vmin <- min(grid_plot$burn_km2, na.rm = TRUE)
+vmax <- max(grid_plot$burn_km2, na.rm = TRUE)
+colors <- c("#fab53b", "#f6ff0a", "#75c878", "#bc0025", "#e2171e")
+final_patch = ggplot(grid_plot) +
+  geom_sf(aes(fill = burn_km2), color = NA) +
+  geom_sf(data = shp1_proj, fill = NA, color = "grey70") +
+  scale_fill_gradientn(
+    name = "Burned Area\n (km²)",
+    colours = colors,
+    limits = c(vmin, vmax),
+    breaks = seq(vmin, vmax, length.out = 5),
+    labels = scales::label_number(accuracy = 1)
+  ) +
+  facet_wrap(~Month, ncol = 2) +
+  coord_sf() + 
+theme_minimal()+
+  scale_x_continuous(breaks = seq(-125, -113, by = 2)) +  # adjust as needed
+  #scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  labs(
+    title = "California Fire Burned Area (JJAS)",
+    x = "Longitude", y = "Latitude",
+    caption = "Source: MCD64"
+  ) +
+  theme_minimal()+
+  annotation_scale(location = "bl", height = unit(0.10, "cm")) +
+  annotation_north_arrow(
+    location = "tr", height = unit(0.6, "cm"), width = unit(0.6, "cm"),
+    style  = north_arrow_fancy_orienteering(text_size = 5, line_width = 0.4)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 0.3, fill = NA),
+    strip.text  = element_text(color = "black", face = "bold", size = 10),
+    plot.title  = element_text(hjust = 0, size = 10, color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 10),
+    axis.title  = element_text(color = "black", size = 10, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(1.0, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 10, face = "bold", color = "black"),
+    legend.text  = element_text(size = 10, color = "black")
+  )
+
+ggsave(
+  filename = "final_maps_fire.jpeg",
+  plot = final_patch,
+  width = 8,    # Adjust based on desired size
+  height = 8,
+  dpi = 300
+)
