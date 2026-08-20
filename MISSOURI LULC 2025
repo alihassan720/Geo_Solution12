@@ -1,0 +1,480 @@
+#========================================================
+# MISSOURI LULC 2025
+# FAST + CORRECT CRS WORKFLOW
+#========================================================
+
+library(terra)
+library(sf)
+library(tigris)
+library(ggplot2)
+
+options(tigris_use_cache = TRUE)
+
+
+#========================================================
+# 1. Read the three LULC rasters
+#========================================================
+
+lulc1 <- rast(
+  "15S_20250101-20251231.tif"
+)
+
+lulc2 <- rast(
+  "16S_20250101-20251231.tif"
+)
+
+lulc3 <- rast(
+  "15T_20250101-20251231.tif"
+)
+
+
+#========================================================
+# 2. Check original CRS
+#========================================================
+
+print(crs(lulc1))
+print(crs(lulc2))
+print(crs(lulc3))
+
+
+#========================================================
+# 3. Get Missouri boundary
+#========================================================
+
+missouri <- states(
+  cb = TRUE,
+  year = 2024,
+  class = "sf"
+)
+
+missouri <- missouri[
+  missouri$STUSPS == "MO",
+]
+
+
+#========================================================
+# 4. Missouri boundary in UTM Zone 15N
+#========================================================
+
+missouri_15 <- st_transform(
+  missouri,
+  crs(lulc1)
+)
+
+missouri_15_v <- vect(
+  missouri_15
+)
+
+
+#========================================================
+# 5. Missouri boundary in UTM Zone 16N
+#========================================================
+#
+# IMPORTANT:
+# 16S is EPSG:32616
+#
+# Therefore Missouri must first be transformed
+# to EPSG:32616 before cropping 16S.
+#
+
+missouri_16 <- st_transform(
+  missouri,
+  crs(lulc2)
+)
+
+missouri_16_v <- vect(
+  missouri_16
+)
+
+
+#========================================================
+# 6. Get Missouri extent in UTM Zone 16N
+#========================================================
+
+mo_ext_16 <- ext(
+  missouri_16_v
+)
+
+print(mo_ext_16)
+
+
+#========================================================
+# 7. CROP 16S BEFORE REPROJECTING
+#========================================================
+#
+# This is the major speed improvement.
+#
+# DO NOT reproject the full 16S raster.
+#
+
+lulc2_mo_16 <- crop(
+  lulc2,
+  mo_ext_16
+)
+
+print(lulc2_mo_16)
+
+
+#========================================================
+# 8. Reproject ONLY Missouri portion of 16S
+#========================================================
+
+lulc2_mo_15 <- project(
+  lulc2_mo_16,
+  crs(lulc1),
+  method = "near"
+)
+
+print(lulc2_mo_15)
+
+
+#========================================================
+# 9. Get Missouri extent in UTM Zone 15N
+#========================================================
+
+mo_ext_15 <- ext(
+  missouri_15_v
+)
+
+print(mo_ext_15)
+
+
+#========================================================
+# 10. Crop 15S to Missouri extent
+#========================================================
+
+lulc1_mo <- crop(
+  lulc1,
+  mo_ext_15
+)
+
+
+#========================================================
+# 11. Crop 15T to Missouri extent
+#========================================================
+
+lulc3_mo <- crop(
+  lulc3,
+  mo_ext_15
+)
+
+
+#========================================================
+# 12. Check cropped rasters
+#========================================================
+
+print(lulc1_mo)
+print(lulc2_mo_15)
+print(lulc3_mo)
+
+
+#========================================================
+# 13. Check CRS
+#========================================================
+
+print(crs(lulc1_mo))
+print(crs(lulc2_mo_15))
+print(crs(lulc3_mo))
+
+
+#========================================================
+# 14. Mosaic the three Missouri portions
+#========================================================
+
+lulc_mo <- mosaic(
+  lulc1_mo,
+  lulc2_mo_15,
+  lulc3_mo,
+  fun = "first"
+)
+
+print(lulc_mo)
+
+
+#========================================================
+# 15. FINAL Missouri mask
+#========================================================
+
+lulc_mo <- mask(
+  lulc_mo,
+  missouri_15_v
+)
+
+print(lulc_mo)
+
+
+#========================================================
+# 16. Save final 10-m Missouri LULC
+#========================================================
+
+writeRaster(
+  lulc_mo,
+  "Missouri_LULC_2025_10m.tif",
+  overwrite = TRUE
+)
+
+
+#========================================================
+# 17. Check LULC classes
+#========================================================
+#========================================================
+# 17. Check LULC classes - MEMORY SAFE
+#========================================================
+
+lulc_freq <- freq(
+  lulc_mo
+)
+
+print(lulc_freq)
+
+#========================================================
+# 18. Create smaller raster ONLY for visualization
+#========================================================
+#
+# Original raster = 10 m
+#
+# fact = 50
+# Visualization raster ≈ 500 m
+#
+# This does NOT change the saved 10-m raster.
+#
+
+lulc_mo_plot <- aggregate(
+  lulc_mo,
+  fact = 50,
+  fun = "modal",
+  na.rm = TRUE
+)
+
+
+#========================================================
+# 19. Convert visualization raster to dataframe
+#========================================================
+
+lulc_df <- as.data.frame(
+  lulc_mo_plot,
+  xy = TRUE,
+  na.rm = TRUE
+)
+
+names(lulc_df)[3] <- "LULC"
+
+
+#========================================================
+# 20. Convert LULC to numeric
+#========================================================
+
+lulc_df$LULC <- as.numeric(
+  as.character(
+    lulc_df$LULC
+  )
+)
+
+
+#========================================================
+# 21. Check actual classes
+#========================================================
+
+print(
+  sort(
+    unique(
+      lulc_df$LULC
+    )
+  )
+)
+
+print(
+  table(
+    lulc_df$LULC
+  )
+)
+
+
+#========================================================
+# 22. Define LULC class names
+#========================================================
+
+lulc_names <- c(
+  "1"  = "Water",
+  "2"  = "Trees",
+  "4"  = "Flooded Vegetation",
+  "5"  = "Crops",
+  "7"  = "Built",
+  "8"  = "Bare",
+  "11" = "Rangeland"
+)
+
+
+#========================================================
+# 23. Assign class names
+#========================================================
+
+lulc_df$Class <- factor(
+  lulc_df$LULC,
+  levels = as.numeric(
+    names(lulc_names)
+  ),
+  labels = unname(
+    lulc_names
+  )
+)
+
+
+#========================================================
+# 24. Define colors
+#========================================================
+
+lulc_colors <- c(
+  "Water"              = "#2F80C0",  # Deep blue
+  
+  "Trees"              = "#1B7837",  # Dark green
+  
+  "Flooded Vegetation" = "#6A7FB5",  # Blue-purple
+  
+  "Crops"              = "#D9A441",  # Golden yellow
+  
+  "Built"              = "#C73E3A",  # Brick red
+  
+  "Bare"               = "#9C8B7A",  # Warm gray-brown
+  
+  "Rangeland"          = "#8FAF45"   # Olive green
+  
+)
+
+
+#========================================================
+# 25. Create Missouri LULC map
+#========================================================
+
+p <- ggplot() +
+  
+  #------------------------------------------------------
+# LULC raster
+#------------------------------------------------------
+
+geom_raster(
+  data = lulc_df,
+  aes(
+    x = x,
+    y = y,
+    fill = Class
+  )
+) +
+  
+  #------------------------------------------------------
+# Missouri boundary
+#------------------------------------------------------
+
+geom_sf(
+  data = missouri_15,
+  fill = NA,
+  color = "grey50",
+  linewidth = 0.4
+) +
+  
+  #------------------------------------------------------
+# Coordinate system
+#------------------------------------------------------
+
+coord_sf(
+  
+) +
+  
+  #------------------------------------------------------
+# Colors
+#------------------------------------------------------
+
+scale_fill_manual(
+  values = lulc_colors,
+  name = "Land Cover",
+  drop = FALSE,
+  na.value = "transparent"
+) +
+  
+  #------------------------------------------------------
+# Labels
+#------------------------------------------------------
+
+labs(
+  title = "Land Use and Land Cover of Missouri",
+  subtitle = "Sentinel-2 10m, 2025",
+  x = "Longitude",
+  y = "Latitude"
+) +
+  theme_minimal() +
+  scale_x_continuous(
+    guide = guide_axis(check.overlap = TRUE))+
+  #scale_x_continuous(breaks = seq(-109, -107, by = 1.5)) +  # adjust as needed
+  #scale_y_continuous(breaks = seq(36, 41, by = 1)) +    # adjust as needed
+  annotation_scale(
+    location = "bl",
+    pad_x = unit(0.3, "cm"),
+    pad_y = unit(0.3, "cm"),
+    height = unit(0.12, "cm"),
+    width_hint = 0.22,
+    text_cex = .5
+  ) +
+  annotation_north_arrow(
+    location = "tr",
+    pad_x = unit(0.030, "cm"),
+    pad_y = unit(0.30, "cm"),
+    height = unit(0.6, "cm"),
+    width  = unit(0.6, "cm"),
+    style = north_arrow_fancy_orienteering(
+      text_size = 5,
+      line_width = 0.5
+    )
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    #aspect.ratio = .65,
+    panel.border = element_rect(color = "black", linewidth = 0.2, fill = NA),
+    panel.background = element_blank(),
+    strip.background = element_blank(),
+    strip.text  = element_text(color = "black", face = "bold", size = 7),
+    plot.title  = element_text(hjust = 0, size = 7, color = "black", face = "bold"),
+    plot.subtitle = element_text(hjust = 0,size = 7,color = "black", face = "bold"),
+    axis.text   = element_text(color = "black", size = 7),
+    axis.title  = element_text(color = "black", size = 7, face = "bold"),
+    panel.spacing = unit(0, "cm"),
+    #legend.position = "top",
+    #legend.title.position = "top",
+    #legend.box = "vertical",
+    #legend.text = element_text(angle = 90),
+    #legend.text.align = 5,
+    #legend.key.spacing = unit(0,"cm"),
+    #legend.text.position = "bottom",
+    #plot.margin = margin(5, 15, 5, 5),
+    #legend.ticks.length = unit(c(-.25, 0), 'cm'), # different lengths for ticks on both sides
+    #legend.ticks = element_line(color='black'), # just to show the ticks on a white background
+    #legend.key = element_rect(color = "black", linewidth = 0.3),
+    axis.ticks  = element_line(size = 0.1, color = "black"),
+    legend.key.height = unit(0.48, "cm"),
+    legend.key.width  = unit(0.2, "cm"),
+    legend.title = element_text(size = 6, face = "bold", color = "black"),
+    legend.text  = element_text(size = 6, face = "bold",color = "black")
+  )
+
+#========================================================
+# 26. Display map
+#========================================================
+
+print(p)
+
+
+#========================================================
+# 27. Save map
+#========================================================
+
+ggsave(
+  "Missouri_LULC_2025.png",
+  plot = p,
+  width = 5,
+  height = 3.5,
+  dpi = 300
+)
+
+
+#========================================================
+# END
+#========================================================
